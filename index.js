@@ -3,12 +3,13 @@ import Redis from "ioredis";
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
 import cors from "cors";
-app.use(cors());
+
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
+app.use(cors());
 
 // Persistent Redis connection
 const redis = new Redis(process.env.REDIS_URL);
