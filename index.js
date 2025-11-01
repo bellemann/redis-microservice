@@ -1,30 +1,18 @@
 import express from "express";
+import cors from "cors";
 import Redis from "ioredis";
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
-import cors from "cors";
-
 
 dotenv.config();
 
 const app = express();
-app.use(express.json());
 app.use(cors());
+app.use(express.json());
 
-// Persistent Redis connection
 const redis = new Redis(process.env.REDIS_URL);
 
-// ==== PUBLIC ROUTES ====
-
-// optional helper for quickly generating tokens manually
-app.post("/auth/token", (req, res) => {
-  const token = jwt.sign({ user: "admin" }, process.env.JWT_SECRET, {
-    expiresIn: "7d",
-  });
-  res.json({ token });
-});
-
-// ==== AUTH MIDDLEWARE ====
+// ===== JWT AUTH MIDDLEWARE =====
 app.use((req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: "Missing token" });
@@ -32,20 +20,17 @@ app.use((req, res, next) => {
   const token = authHeader.replace("Bearer ", "");
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
+    req.user = decoded; // store user info
     next();
   } catch {
     return res.status(401).json({ error: "Invalid token" });
   }
 });
 
-// ==== CORE ROUTES ====
-
-// Upstash-compatible batch endpoint
+// ====== READ-ONLY, UPSTASH-COMPATIBLE ENDPOINT ======
+// Works just like Upstash REST but enforces read-only + access control.
 app.post("/", async (req, res) => {
   let commands = req.body;
-
-  // Support both plain [[...]] and { commands: [[...]] }
   if (!Array.isArray(commands)) {
     if (Array.isArray(req.body.commands)) {
       commands = req.body.commands;
@@ -58,35 +43,53 @@ app.post("/", async (req, res) => {
 
   const results = [];
 
-  for (const [cmd, ...args] of commands) {
-    try {
-      // You can optionally allow specific commands
-      const allowed = [
-        "SET",
-        "GET",
-        "DEL",
-        "HINCRBY",
-        "HGETALL",
-        "ZADD",
-        "ZINCRBY",
-        "ZREVRANGE",
-        "EXPIRE",
-        "INCR",
-        "DECR",
-        "MSET",
-        "MGET",
-        "HSET",
-        "HGET",
-        "ZCARD",
-      ];
+  for (const [cmdRaw, ...args] of commands) {
+    const cmd = cmdRaw.toUpperCase();
 
-      if (!allowed.includes(cmd.toUpperCase())) {
-        results.push(`ERR unknown command ${cmd}`);
-        continue;
+    // ===== Prevent write commands =====
+    const writeCommands = [
+      "SET",
+      "DEL",
+      "HSET",
+      "HINCRBY",
+      "ZADD",
+      "ZREM",
+      "INCR",
+      "DECR",
+      "MSET",
+      "APPEND",
+      "EXPIRE"
+    ];
+
+    if (writeCommands.includes(cmd)) {
+      results.push("ERR read-only mode");
+      continue;
+    }
+
+    try {
+      // === Access Control for "user:<id>:following" keys ===
+      // Only the owner user_id in token can read that key.
+      // Example key: user:123:following
+      const restricted =
+        args &&
+        args.length > 0 &&
+        typeof args[0] === "string" &&
+        /^user:\d+:following$/.test(args[0]); // matches pattern
+
+      if (restricted) {
+        const key = args[0];
+        const idInKey = parseInt(key.split(":")[1], 10);
+        const tokenUserId = parseInt(req.user.user_id, 10);
+
+        if (idInKey !== tokenUserId) {
+          results.push("ERR forbidden: private resource");
+          continue;
+        }
       }
 
-      const out = await redis[cmd.toLowerCase()](...args);
-      results.push(out);
+      // If allowed, perform the command
+      const result = await redis[cmd.toLowerCase()](...args);
+      results.push(result);
     } catch (err) {
       results.push(`ERR ${err.message}`);
     }
@@ -95,20 +98,7 @@ app.post("/", async (req, res) => {
   res.json(results);
 });
 
-// Simple example endpoints
-app.post("/hit", async (req, res) => {
-  const { postId, metric } = req.body;
-  if (!postId || !metric) return res.status(400).send("Missing params");
-  await redis.hincrby(`post:${postId}`, metric, 1);
-  res.send("ok");
-});
-
-app.get("/stats/:id", async (req, res) => {
-  const data = await redis.hgetall(`post:${req.params.id}`);
-  res.json(data);
-});
-
-// ==== START SERVER ====
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Redis microservice running with Upstash-style API + JWT auth");
-});
+// ===== Server startup =====
+app.listen(process.env.PORT || 3000, () =>
+  console.log("Read-only Redis API with permissions + JWT auth running.")
+);
