@@ -2,6 +2,8 @@ import express from "express";
 import Redis from "ioredis";
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
+import cors from "cors";
+app.use(cors());
 
 dotenv.config();
 
