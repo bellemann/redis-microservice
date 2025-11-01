@@ -4,7 +4,7 @@
 #
 
 app = 'redis-microservice-uwaxdg'
-primary_region = 'iad'
+primary_region = 'fra'
 
 [build]
 
