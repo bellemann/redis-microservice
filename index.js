@@ -10,59 +10,76 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Redis connection, disable ready‑check to avoid INFO permission warning
+// ===== Redis connection (disable ready check warning) =====
 const redis = new Redis(process.env.REDIS_URL, { enableReadyCheck: false });
 
-// Quick ping to test if the app is live (no auth)
-app.get("/ping", (_req, res) => res.send("pong"));
+// ===== Simple /ping test (no auth) =====
+app.all("/ping", (_req, res) => {
+  res.send("pong");
+});
 
-// JWT authentication middleware
+// ===== JWT AUTH MIDDLEWARE =====
 app.use((req, res, next) => {
   const authHeader = req.headers.authorization;
   console.log("Authorization header I got:", authHeader);
-  if (!authHeader)
-    return res.status(401).json({ error: "Missing token" });
+  if (!authHeader) return res.status(401).json({ error: "Missing token" });
 
   const token = authHeader.replace("Bearer ", "");
   try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
     next();
   } catch {
     return res.status(401).json({ error: "Invalid token" });
   }
 });
 
-// Main read‑only redis proxy
+// ===== Read‑only Redis proxy endpoint =====
 app.post("/", async (req, res) => {
-  const body = Array.isArray(req.body)
-    ? req.body
-    : Array.isArray(req.body.commands)
-    ? req.body.commands
-    : null;
-  if (!body) return res.status(400).json({ error: "Body must be array" });
+  let commands = req.body;
+  if (!Array.isArray(commands)) {
+    if (Array.isArray(req.body.commands)) commands = req.body.commands;
+    else
+      return res
+        .status(400)
+        .json({ error: "Body must be an array of Redis commands" });
+  }
 
   const results = [];
   const tokenUserId = req.user.user_id;
 
-  for (const [cmdRaw, ...args] of body) {
+  for (const [cmdRaw, ...args] of commands) {
     const cmd = cmdRaw.toUpperCase();
+
+    // disallow write ops
     const writeCommands = [
-      "SET", "DEL", "HSET", "HINCRBY", "ZADD", "ZREM",
-      "INCR", "DECR", "MSET", "APPEND", "EXPIRE"
+      "SET",
+      "DEL",
+      "HSET",
+      "HINCRBY",
+      "ZADD",
+      "ZREM",
+      "INCR",
+      "DECR",
+      "MSET",
+      "APPEND",
+      "EXPIRE"
     ];
     if (writeCommands.includes(cmd)) {
-      results.push("ERR read‑only mode");
+      results.push("ERR read-only mode");
       continue;
     }
 
     try {
-      const argsProcessed = args.map(x =>
-        typeof x === "string" ? x.replace("user:AUTH", `user:${tokenUserId}`) : x
+      // Replace user:AUTH placeholders
+      const argsProcessed = args.map((a) =>
+        typeof a === "string" ? a.replace("user:AUTH", `user:${tokenUserId}`) : a
       );
 
-      // Owner check for user:<id>:following
+      // Restrict user:<id>:following access
       if (
-        argsProcessed[0] &&
+        argsProcessed.length > 0 &&
+        typeof argsProcessed[0] === "string" &&
         /^user:[\w-]+:following$/.test(argsProcessed[0])
       ) {
         const idInKey = argsProcessed[0].split(":")[1];
@@ -72,58 +89,75 @@ app.post("/", async (req, res) => {
         }
       }
 
-      // Block reading otp:* or session*
+      // Block sensitive keys like otp:* and session*
       if (
-        argsProcessed[0] &&
-        (/^otp:[\w-]+$/.test(argsProcessed[0]) ||
-          /^session[\w-]+$/.test(argsProcessed[0]))
+        argsProcessed.length > 0 &&
+        typeof argsProcessed[0] === "string"
       ) {
-        results.push("ERR forbidden: private key");
-        continue;
+        const key = argsProcessed[0];
+        if (/^otp:[\w-]+$/.test(key) || /^session[\w-]+$/.test(key)) {
+          results.push("ERR forbidden: private key");
+          continue;
+        }
       }
 
+      // Console logging for debug
       console.log("=== Redis Request ===");
-      console.log("User:", tokenUserId);
-      console.log("Command:", cmd);
-      console.log("Args original:", args);
-      console.log("Args processed:", argsProcessed);
+      console.log("JWT user_id:", req.user.user_id);
+      console.log("Command:", cmdRaw);
+      console.log("Original args:", args);
+      console.log("Resolved args:", argsProcessed);
 
       const result = await redis[cmd.toLowerCase()](...argsProcessed);
+
       console.log("Redis result:", result);
       console.log("=====================");
 
       results.push(result);
-    } catch (e) {
-      console.error("Redis error:", e);
-      results.push(`ERR ${e.message}`);
+    } catch (err) {
+      console.error("Redis error:", err);
+      results.push(`ERR ${err.message}`);
     }
   }
 
   res.json(results);
 });
 
-// /debug-auth shows what user:AUTH resolves to
-app.get("/debug-auth", async (req, res) => {
+// ===== /debug-auth: shows resolved Redis key =====
+app.all("/debug-auth", async (req, res) => {
   try {
-    const key = `user:${req.user.user_id}`;
-    const data = await redis.hgetall(key);
+    const tokenUserId = req.user.user_id;
+    const resolvedKey = `user:${tokenUserId}`;
+    const data = await redis.hgetall(resolvedKey);
 
-    console.log("/debug-auth key:", key, "data:", data);
-    res.json({ user_id: req.user.user_id, key, data });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.log("=== /debug-auth ===");
+    console.log("Token user_id:", tokenUserId);
+    console.log("Resolved key:", resolvedKey);
+    console.log("Redis data:", data);
+    console.log("===================");
+
+    res.json({
+      user_id: tokenUserId,
+      resolved_key: resolvedKey,
+      redis_data: data
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// /whoami dumps the decoded JWT
-app.get("/whoami", (req, res) =>
-  res.json({ jwt_payload: req.user, resolved_user_key: `user:${req.user.user_id}` })
-);
+// ===== /whoami: return JWT payload =====
+app.all("/whoami", (req, res) => {
+  res.json({
+    jwt_payload: req.user,
+    resolved_user_key: `user:${req.user.user_id}`
+  });
+});
 
-// Error handlers
-process.on("uncaughtException", e => console.error("Uncaught:", e));
-process.on("unhandledRejection", e => console.error("Unhandled:", e));
+// ===== Error / crash logging =====
+process.on("uncaughtException", (err) => console.error("Uncaught:", err));
+process.on("unhandledRejection", (err) => console.error("Unhandled:", err));
 
-// Start server
+// ===== Start server =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
