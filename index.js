@@ -1,3 +1,4 @@
+app.get("/", (req, res) => res.send("Alive: build test"));
 console.log("=== BUILD VERSION: debug-auth test build ===");
 import express from "express";
 import cors from "cors";
