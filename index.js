@@ -8,6 +8,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
+app.options("*", cors()); // Preflight support for all routes
 app.use(express.json());
 
 // ===== Redis connection (disable ready check warning) =====
@@ -18,18 +19,40 @@ app.all("/ping", (_req, res) => {
   res.send("pong");
 });
 
+// ===== Public health endpoint (no auth) =====
+app.get("/healthz", (_req, res) => {
+  res.json({ status: "ok" });
+});
+
+// ===== Public welcome/info (no auth) =====
+app.get("/", (_req, res) => {
+  res.type("text").send("Redis Microservice online. Public: /ping, /healthz. Auth routes: POST /, /whoami, /debug-auth.");
+});
+
 // ===== JWT AUTH MIDDLEWARE =====
 app.use((req, res, next) => {
-  const authHeader = req.headers.authorization;
+  // Allow CORS preflight requests through without auth
+  if (req.method === "OPTIONS") return next();
+
+  const authHeader =
+    req.headers.authorization ||
+    req.headers["x-authorization"] ||
+    req.headers["x-access-token"];
+
   console.log("Authorization header I got:", authHeader);
   if (!authHeader) return res.status(401).json({ error: "Missing token" });
 
-  const token = authHeader.replace("Bearer ", "");
+  const parts = String(authHeader).split(" ");
+  const token =
+    parts.length === 2 && parts[0].toLowerCase() === "bearer"
+      ? parts[1]
+      : String(authHeader);
+
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
     next();
-  } catch {
+  } catch (e) {
     return res.status(401).json({ error: "Invalid token" });
   }
 });

@@ -1,0 +1,187 @@
+###
+# Redis Microservice - REST Client Examples
+#
+# This file contains example HTTP requests for testing the Redis microservice.
+# Use with VS Code REST Client extension or similar tools.
+#
+# To use these examples:
+# 1. Generate a JWT token: node generate-test-token.js <user_id>
+# 2. Replace <your-jwt-token-here> below with your token
+# 3. Click "Send Request" above each request
+###
+
+### Variables
+@baseUrl = http://localhost:3000
+@token = <your-jwt-token-here>
+
+###############################################################################
+# PUBLIC ENDPOINTS (No Authentication Required)
+###############################################################################
+
+### GET / - Welcome message
+GET {{baseUrl}}/
+
+### GET /ping - Health check
+GET {{baseUrl}}/ping
+
+### GET /healthz - Health status
+GET {{baseUrl}}/healthz
+
+###############################################################################
+# PROTECTED ENDPOINTS (JWT Authentication Required)
+###############################################################################
+
+### GET /whoami - View JWT payload
+GET {{baseUrl}}/whoami
+Authorization: Bearer {{token}}
+
+### POST /whoami - View JWT payload (POST method)
+POST {{baseUrl}}/whoami
+Authorization: Bearer {{token}}
+
+### GET /debug-auth - Test key resolution
+GET {{baseUrl}}/debug-auth
+Authorization: Bearer {{token}}
+
+### POST /debug-auth - Test key resolution
+POST {{baseUrl}}/debug-auth
+Authorization: Bearer {{token}}
+
+###############################################################################
+# REDIS PROXY ENDPOINTS
+###############################################################################
+
+### Redis GET - Get user's following list (with placeholder)
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["GET", "user:AUTH:following"]]
+
+### Redis HGETALL - Get user hash data
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HGETALL", "user:AUTH"]]
+
+### Redis SMEMBERS - Get set members (followers)
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["SMEMBERS", "user:AUTH:followers"]]
+
+### Redis HGET - Get specific hash field
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HGET", "user:AUTH", "name"]]
+
+### Redis MGET - Get multiple keys
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["MGET", "user:AUTH:posts_count", "user:AUTH:followers_count"]]
+
+### Redis EXISTS - Check if key exists
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["EXISTS", "user:AUTH:following"]]
+
+### Redis ZRANGE - Query leaderboard (public data)
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["ZRANGE", "leaderboard", "0", "10"]]
+
+### Redis LRANGE - Get list range
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["LRANGE", "user:AUTH:notifications", "0", "10"]]
+
+### Redis TTL - Check key expiration
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["TTL", "user:AUTH:session"]]
+
+### Redis TYPE - Get key type
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["TYPE", "user:AUTH:following"]]
+
+###############################################################################
+# ERROR EXAMPLES
+###############################################################################
+
+### ERROR: No token provided (401 Unauthorized)
+POST {{baseUrl}}/
+Content-Type: application/json
+
+[["GET", "user:AUTH:following"]]
+
+### ERROR: Invalid token (401 Unauthorized)
+POST {{baseUrl}}/
+Authorization: Bearer invalid-token-here
+Content-Type: application/json
+
+[["GET", "user:AUTH:following"]]
+
+### ERROR: Access to other user's data (403 Forbidden)
+# Assuming your user_id is 123, trying to access user:456:*
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["GET", "user:456:following"]]
+
+### ERROR: Write command blocked (Read-only mode)
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["SET", "user:AUTH:test", "value"]]
+
+### ERROR: Delete command blocked (Read-only mode)
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["DEL", "user:AUTH:test"]]
+
+### ERROR: Sensitive key access (403 Forbidden)
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["GET", "otp:123456"]]
+
+### ERROR: Session key access (403 Forbidden)
+POST {{baseUrl}}/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["GET", "session:abc123"]]
+
+###############################################################################
+# ALTERNATIVE AUTHENTICATION HEADERS
+###############################################################################
+
+### Using x-authorization header
+POST {{baseUrl}}/whoami
+x-authorization: {{token}}
+
+### Using x-access-token header
+POST {{baseUrl}}/whoami
+x-access-token: {{token}}
