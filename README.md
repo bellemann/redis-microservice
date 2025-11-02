@@ -95,6 +95,16 @@ This allows clients to query their own data without knowing their user_id in adv
 
 The service provides two feed endpoints for retrieving posts with user data.
 
+**Privacy & Data Sanitization:**
+When viewing other users' profiles, sensitive fields are automatically removed for privacy protection. The following fields are only visible when viewing your own profile:
+- `first_name`, `last_name`
+- `email`, `phone`, `phone_number`
+- `address`, `date_of_birth`, `birth_date`
+- `password`, `password_hash`
+- Other sensitive PII fields
+
+Public fields (like `username`, `display_name`, `bio`, `avatar`, etc.) remain visible for all users.
+
 ### GET /feed/explore
 
 Returns posts from the global `explore:feed` sorted set (newest first).
@@ -223,11 +233,15 @@ The feed endpoints expect the following Redis key structure:
 
 ## Performance Notes
 
-- **Caching**: Both feed endpoints implement 30-second in-memory caching to reduce Redis load
+- **Multi-Level Caching**:
+  - **Feed Cache**: 30 seconds - Full feed response caching
+  - **Post Cache**: 10 minutes - Individual post data cached globally across all requests
+  - **User Cache**: 5 minutes - User profile data cached to reduce user lookups
+- **Cache-First Strategy**: Posts and users are checked in memory cache before querying Redis, dramatically reducing roundtrips
 - **Pagination Limit**: Maximum limit of 100 posts per request prevents excessive data transfer
 - **Following Feed Optimization**: Uses Redis `ZUNIONSTORE` to efficiently merge posts from multiple followed users into a temporary sorted set
 - **Fallback Mode**: If `user:{uuid}:posts` structures are missing, the following feed falls back to filtering `explore:feed`, which is less efficient but ensures functionality
-- **Cache Keys**: Cache keys include pagination parameters to ensure correct results for different page requests
+- **Pipeline Optimization**: Only uncached posts/users are fetched via Redis pipelines
 
 ## Security Features
 

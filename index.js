@@ -87,6 +87,7 @@ function createTrackedRedis(requestId) {
 // ===== In-Memory Cache =====
 const cache = {};
 const userCache = {}; // Separate aggressive cache for user data
+const postCache = {}; // Global aggressive cache for post data
 
 function getCached(key) {
   const entry = cache[key];
@@ -120,6 +121,59 @@ function setUserCache(userId, data, ttlSeconds = 300) { // 5 minutes default for
     data,
     expires: Date.now() + ttlSeconds * 1000
   };
+}
+
+function getPostCached(postId) {
+  const entry = postCache[postId];
+  if (!entry) return null;
+  if (Date.now() > entry.expires) {
+    delete postCache[postId];
+    return null;
+  }
+  return entry.data;
+}
+
+function setPostCache(postId, data, ttlSeconds = 600) { // 10 minutes default for posts
+  postCache[postId] = {
+    data,
+    expires: Date.now() + ttlSeconds * 1000
+  };
+}
+
+// ===== User Data Sanitization =====
+const SENSITIVE_USER_FIELDS = [
+  'first_name',
+  'last_name',
+  'phone',
+  'email',
+  'password',
+  'password_hash',
+  'phone_number',
+  'address',
+  'date_of_birth',
+  'birth_date',
+  'ssn',
+  'credit_card',
+  'bank_account',
+  'ip_address',
+  'device_id'
+];
+
+function sanitizeUserData(userData, userId, authenticatedUserId) {
+  if (!userData || Object.keys(userData).length === 0) return userData;
+
+  // If viewing own profile, return all data
+  if (userId === authenticatedUserId) {
+    return userData;
+  }
+
+  // For other users, remove sensitive fields
+  const sanitized = { ...userData };
+  for (const field of SENSITIVE_USER_FIELDS) {
+    delete sanitized[field];
+  }
+
+  return sanitized;
 }
 
 // ===== Simple /ping test (no auth) =====
@@ -185,8 +239,8 @@ app.get("/feed/explore", async (req, res) => {
       // No more posts available
       if (postIds.length === 0) break;
 
-      // Aggregate posts with optional user data
-      const aggregated = await aggregatePostsWithUsers(postIds, requestId, includeUser);
+      // Aggregate posts with optional user data (no authenticated user for public explore feed)
+      const aggregated = await aggregatePostsWithUsers(postIds, requestId, includeUser, null);
       posts.push(...aggregated);
 
       // If we've collected enough posts, trim to exact limit
@@ -258,33 +312,70 @@ app.use((req, res, next) => {
 });
 
 // ===== Helper: Aggregate posts with user data =====
-async function aggregatePostsWithUsers(postIds, requestId, includeUser = true) {
+async function aggregatePostsWithUsers(postIds, requestId, includeUser = true, authenticatedUserId = null) {
   if (postIds.length === 0) return [];
 
   console.log(`[aggregatePostsWithUsers] Processing ${postIds.length} post IDs (includeUser: ${includeUser})`);
 
   const trackedRedis = createTrackedRedis(requestId);
 
-  // First pipeline: Fetch all posts
-  const postPipeline = trackedRedis.pipeline();
+  // First: Check post cache and collect uncached post IDs
+  const uncachedPostIds = [];
+  const postMap = {}; // Map of postId -> postData
+
   for (const postId of postIds) {
-    postPipeline.hgetall(`post:${postId}`);
+    const cachedPost = getPostCached(postId);
+    if (cachedPost) {
+      console.log(`[aggregatePostsWithUsers] Post cache HIT for ${postId}`);
+      postMap[postId] = cachedPost;
+    } else {
+      uncachedPostIds.push(postId);
+    }
   }
-  const postResults = await postPipeline.exec();
+
+  console.log(`[aggregatePostsWithUsers] ${Object.keys(postMap).length} posts from cache, ${uncachedPostIds.length} posts to fetch`);
+
+  // Second pipeline: Fetch only uncached posts
+  if (uncachedPostIds.length > 0) {
+    const postPipeline = trackedRedis.pipeline();
+    for (const postId of uncachedPostIds) {
+      postPipeline.hgetall(`post:${postId}`);
+    }
+    const postResults = await postPipeline.exec();
+
+    // Process fetched posts and cache them
+    for (let i = 0; i < uncachedPostIds.length; i++) {
+      const postId = uncachedPostIds[i];
+      const [err, postData] = postResults[i];
+
+      if (err || !postData || Object.keys(postData).length === 0) {
+        console.log(`[aggregatePostsWithUsers] Skipping post ${postId}: empty or error`);
+        continue;
+      }
+
+      // Cache the post for 10 minutes
+      setPostCache(postId, postData, 600);
+      postMap[postId] = postData;
+    }
+  }
+
+  // Build posts array in original order
+  const posts = [];
+  for (const postId of postIds) {
+    const postData = postMap[postId];
+    if (postData) {
+      posts.push(postData);
+    } else {
+      posts.push(null);
+    }
+  }
 
   // Collect user_id values and build unique set, check cache first
   const userIds = new Set();
-  const posts = [];
   const userMap = {};
 
-  for (let i = 0; i < postIds.length; i++) {
-    const [err, postData] = postResults[i];
-    if (err || !postData || Object.keys(postData).length === 0) {
-      console.log(`[aggregatePostsWithUsers] Skipping post ${postIds[i]}: empty or error`);
-      posts.push(null);
-      continue;
-    }
-    posts.push(postData);
+  for (const postData of posts) {
+    if (!postData) continue;
 
     // Only fetch users if includeUser is true
     if (includeUser && postData.user_id) {
@@ -323,7 +414,7 @@ async function aggregatePostsWithUsers(postIds, requestId, includeUser = true) {
         console.log(`[aggregatePostsWithUsers] Fetched user ${userId}:`, Object.keys(userDataObj).length > 0 ? Object.keys(userDataObj) : 'EMPTY');
 
         userMap[userId] = userDataObj;
-        // Cache user data for 5 minutes
+        // Cache user data for 5 minutes (cache unsanitized data)
         setUserCache(userId, userDataObj, 300);
       }
     }
@@ -335,8 +426,14 @@ async function aggregatePostsWithUsers(postIds, requestId, includeUser = true) {
     if (!postData) continue;
 
     if (includeUser) {
-      // Include user data
-      const userData = postData.user_id ? (userMap[postData.user_id] || {}) : {};
+      // Include user data (sanitized if not own user)
+      let userData = postData.user_id ? (userMap[postData.user_id] || {}) : {};
+
+      // Sanitize user data based on authenticated user
+      if (postData.user_id) {
+        userData = sanitizeUserData(userData, postData.user_id, authenticatedUserId);
+      }
+
       results.push({
         post: postData,
         user: userData
@@ -546,7 +643,7 @@ app.get("/feed/following", async (req, res) => {
 
         // Aggregate the filtered posts
         if (filteredPostIds.length > 0) {
-          const aggregated = await aggregatePostsWithUsers(filteredPostIds, requestId, includeUser);
+          const aggregated = await aggregatePostsWithUsers(filteredPostIds, requestId, includeUser, userId);
           posts.push(...aggregated);
         }
 
@@ -589,7 +686,7 @@ app.get("/feed/following", async (req, res) => {
         if (fetchedIds.length === 0) break;
 
         // Aggregate posts with user data
-        const aggregated = await aggregatePostsWithUsers(fetchedIds, requestId, includeUser);
+        const aggregated = await aggregatePostsWithUsers(fetchedIds, requestId, includeUser, userId);
         posts.push(...aggregated);
 
         // If we've collected enough posts, trim to exact limit
