@@ -32,21 +32,31 @@ app.post("/", async (req, res) => {
   let commands = req.body;
   if (!Array.isArray(commands)) {
     if (Array.isArray(req.body.commands)) commands = req.body.commands;
-    else return res
-      .status(400)
-      .json({ error: "Body must be an array of Redis commands" });
+    else
+      return res
+        .status(400)
+        .json({ error: "Body must be an array of Redis commands" });
   }
 
- const results = [];
-const tokenUserId = req.user.user_id; // UUID or numeric — works for both
+  const results = [];
+  const tokenUserId = req.user.user_id; // UUID or numeric — works for both
 
   for (const [cmdRaw, ...args] of commands) {
     const cmd = cmdRaw.toUpperCase();
 
     // Block write operations
     const writeCommands = [
-      "SET", "DEL", "HSET", "HINCRBY", "ZADD",
-      "ZREM", "INCR", "DECR", "MSET", "APPEND", "EXPIRE"
+      "SET",
+      "DEL",
+      "HSET",
+      "HINCRBY",
+      "ZADD",
+      "ZREM",
+      "INCR",
+      "DECR",
+      "MSET",
+      "APPEND",
+      "EXPIRE"
     ];
     if (writeCommands.includes(cmd)) {
       results.push("ERR read‑only mode");
@@ -55,42 +65,38 @@ const tokenUserId = req.user.user_id; // UUID or numeric — works for both
 
     try {
       // Replace user:AUTH placeholders
-      const argsProcessed = args.map(a =>
-        typeof a === "string"
-          ? a.replace("user:AUTH", `user:${tokenUserId}`)
-          : a
+      const argsProcessed = args.map((a) =>
+        typeof a === "string" ? a.replace("user:AUTH", `user:${tokenUserId}`) : a
       );
 
       // Restrict “user:<id>:following” access
       if (
-  argsProcessed.length > 0 &&
-  typeof argsProcessed[0] === "string" &&
-  /^user:[\w-]+:following$/.test(argsProcessed[0])
-) {
-  const idInKey = argsProcessed[0].split(":")[1];
-  if (idInKey !== tokenUserId) {
-    results.push("ERR forbidden: private resource");
-    continue;
-  }
-}
+        argsProcessed.length > 0 &&
+        typeof argsProcessed[0] === "string" &&
+        /^user:[\w-]+:following$/.test(argsProcessed[0])
+      ) {
+        const idInKey = argsProcessed[0].split(":")[1];
+        if (idInKey !== tokenUserId) {
+          results.push("ERR forbidden: private resource");
+          continue;
+        }
+      }
 
+      // ===== DEBUG LOGGING =====
       console.log("------------ DEBUG ------------");
-console.log("Token user_id:", req.user.user_id);
-console.log("Raw command:", cmdRaw);
-console.log("Original args:", args);
-console.log("Resolved args:", argsProcessed);
+      console.log("Token user_id:", req.user.user_id);
+      console.log("Raw command:", cmdRaw);
+      console.log("Original args:", args);
+      console.log("Resolved args:", argsProcessed);
 
-try {
-  const result = await redis[cmd.toLowerCase()](...argsProcessed);
-  console.log("Redis returned:", result);
-  results.push(result);
-} catch (err) {
-  console.error("Redis error:", err);
-  results.push(`ERR ${err.message}`);
-}
+      const result = await redis[cmd.toLowerCase()](...argsProcessed);
 
-console.log("-------------------------------");
+      console.log("Redis returned:", result);
+      console.log("-------------------------------");
+
+      results.push(result);
     } catch (err) {
+      console.error("Redis error:", err);
       results.push(`ERR ${err.message}`);
     }
   }
@@ -98,9 +104,26 @@ console.log("-------------------------------");
   res.json(results);
 });
 
+// ===== DEBUG ENDPOINT =====
+app.get("/debug/:key", async (req, res) => {
+  try {
+    const key =
+      req.params.key === "AUTH"
+        ? `user:${req.user.user_id}`
+        : req.params.key;
+
+    const data = await redis.hgetall(key);
+    res.json({ key, data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ===== Crash logging =====
-process.on("uncaughtException", err => console.error("Uncaught:", err));
-process.on("unhandledRejection", err => console.error("Unhandled:", err));
+process.on("uncaughtException", (err) => console.error("Uncaught:", err));
+process.on("unhandledRejection", (err) =>
+  console.error("Unhandled:", err)
+);
 
 // ===== Start Server =====
 const PORT = process.env.PORT || 3000;
