@@ -14,6 +14,76 @@ app.use(express.json());
 // ===== Redis connection (disable ready check warning) =====
 const redis = new Redis(process.env.REDIS_URL, { enableReadyCheck: false });
 
+// ===== Redis Request Counter =====
+const requestCounters = new Map();
+
+function getRequestId() {
+  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
+
+function initRedisCounter(requestId) {
+  requestCounters.set(requestId, { commands: 0, pipelines: 0 });
+}
+
+function incrementRedisCounter(requestId, type = 'command') {
+  const counter = requestCounters.get(requestId);
+  if (counter) {
+    if (type === 'pipeline') {
+      counter.pipelines++;
+    } else {
+      counter.commands++;
+    }
+  }
+}
+
+function getRedisCounter(requestId) {
+  return requestCounters.get(requestId) || { commands: 0, pipelines: 0 };
+}
+
+function cleanupRedisCounter(requestId) {
+  requestCounters.delete(requestId);
+}
+
+// Wrap Redis commands to count them
+const originalRedis = {
+  zrevrange: redis.zrevrange.bind(redis),
+  smembers: redis.smembers.bind(redis),
+  exists: redis.exists.bind(redis),
+  zunionstore: redis.zunionstore.bind(redis),
+  expire: redis.expire.bind(redis),
+  hgetall: redis.hgetall.bind(redis),
+  hget: redis.hget.bind(redis),
+  pipeline: redis.pipeline.bind(redis)
+};
+
+function wrapRedisCommand(commandName, originalFn, requestId) {
+  return function(...args) {
+    incrementRedisCounter(requestId, 'command');
+    return originalFn(...args);
+  };
+}
+
+function createTrackedRedis(requestId) {
+  return {
+    zrevrange: wrapRedisCommand('zrevrange', originalRedis.zrevrange, requestId),
+    smembers: wrapRedisCommand('smembers', originalRedis.smembers, requestId),
+    exists: wrapRedisCommand('exists', originalRedis.exists, requestId),
+    zunionstore: wrapRedisCommand('zunionstore', originalRedis.zunionstore, requestId),
+    expire: wrapRedisCommand('expire', originalRedis.expire, requestId),
+    hgetall: wrapRedisCommand('hgetall', originalRedis.hgetall, requestId),
+    hget: wrapRedisCommand('hget', originalRedis.hget, requestId),
+    pipeline: function() {
+      const pipeline = originalRedis.pipeline();
+      const originalExec = pipeline.exec.bind(pipeline);
+      pipeline.exec = async function() {
+        incrementRedisCounter(requestId, 'pipeline');
+        return await originalExec();
+      };
+      return pipeline;
+    }
+  };
+}
+
 // ===== In-Memory Cache =====
 const cache = {};
 const userCache = {}; // Separate aggressive cache for user data
@@ -69,6 +139,10 @@ app.get("/", (_req, res) => {
 
 // ===== GET /feed/explore: Explore feed with pagination (PUBLIC) =====
 app.get("/feed/explore", async (req, res) => {
+  const requestId = getRequestId();
+  initRedisCounter(requestId);
+  const startTime = Date.now();
+
   try {
     const offset = parseInt(req.query.offset) || 0;
     let limit = parseInt(req.query.limit) || 20;
@@ -81,11 +155,15 @@ app.get("/feed/explore", async (req, res) => {
     // Check cache first
     const cached = getCached(cacheKey);
     if (cached) {
-      console.log(`[CACHE HIT] ${cacheKey}`);
+      const duration = Date.now() - startTime;
+      console.log(`✅ [GET /feed/explore] CACHE HIT | Duration: ${duration}ms | Redis: 0 commands, 0 pipelines`);
+      cleanupRedisCounter(requestId);
       return res.json(cached);
     }
 
     console.log(`[CACHE MISS] ${cacheKey}`);
+
+    const trackedRedis = createTrackedRedis(requestId);
 
     // Fetch a buffer of post IDs to account for missing posts/users
     const bufferMultiplier = 2;
@@ -95,7 +173,7 @@ app.get("/feed/explore", async (req, res) => {
 
     // Continue fetching until we have enough posts or run out of items
     while (posts.length < limit) {
-      const postIds = await redis.zrevrange(
+      const postIds = await trackedRedis.zrevrange(
         "explore:feed",
         currentOffset,
         currentOffset + bufferSize - 1
@@ -107,7 +185,7 @@ app.get("/feed/explore", async (req, res) => {
       if (postIds.length === 0) break;
 
       // Aggregate posts with user data
-      const aggregated = await aggregatePostsWithUsers(postIds);
+      const aggregated = await aggregatePostsWithUsers(postIds, requestId);
       posts.push(...aggregated);
 
       // If we've collected enough posts, trim to exact limit
@@ -134,9 +212,18 @@ app.get("/feed/explore", async (req, res) => {
     // Cache the result for 30 seconds
     setCache(cacheKey, response, 30);
 
+    const duration = Date.now() - startTime;
+    const counter = getRedisCounter(requestId);
+    console.log(`✅ [GET /feed/explore] Success | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips`);
+    cleanupRedisCounter(requestId);
+
     res.json(response);
   } catch (err) {
     console.error("Error fetching explore feed:", err);
+    const duration = Date.now() - startTime;
+    const counter = getRedisCounter(requestId);
+    console.log(`❌ [GET /feed/explore] Error | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines`);
+    cleanupRedisCounter(requestId);
     res.status(500).json({ error: "Failed to fetch explore feed" });
   }
 });
@@ -170,13 +257,15 @@ app.use((req, res, next) => {
 });
 
 // ===== Helper: Aggregate posts with user data =====
-async function aggregatePostsWithUsers(postIds) {
+async function aggregatePostsWithUsers(postIds, requestId) {
   if (postIds.length === 0) return [];
 
   console.log(`[aggregatePostsWithUsers] Processing ${postIds.length} post IDs`);
 
+  const trackedRedis = createTrackedRedis(requestId);
+
   // First pipeline: Fetch all posts
-  const postPipeline = redis.pipeline();
+  const postPipeline = trackedRedis.pipeline();
   for (const postId of postIds) {
     postPipeline.hgetall(`post:${postId}`);
   }
@@ -213,7 +302,7 @@ async function aggregatePostsWithUsers(postIds) {
 
   // Second pipeline: Fetch uncached users
   if (userIds.size > 0) {
-    const userPipeline = redis.pipeline();
+    const userPipeline = trackedRedis.pipeline();
     const userIdArray = Array.from(userIds);
 
     for (const userId of userIdArray) {
@@ -344,6 +433,10 @@ app.post("/", async (req, res) => {
 
 // ===== GET /feed/following: Following feed with pagination =====
 app.get("/feed/following", async (req, res) => {
+  const requestId = getRequestId();
+  initRedisCounter(requestId);
+  const startTime = Date.now();
+
   try {
     const userId = req.user.user_id;
     const offset = parseInt(req.query.offset) || 0;
@@ -357,14 +450,18 @@ app.get("/feed/following", async (req, res) => {
     // Check cache first
     const cached = getCached(cacheKey);
     if (cached) {
-      console.log(`[CACHE HIT] ${cacheKey}`);
+      const duration = Date.now() - startTime;
+      console.log(`✅ [GET /feed/following] CACHE HIT | Duration: ${duration}ms | Redis: 0 commands, 0 pipelines`);
+      cleanupRedisCounter(requestId);
       return res.json(cached);
     }
 
     console.log(`[CACHE MISS] ${cacheKey}`);
 
+    const trackedRedis = createTrackedRedis(requestId);
+
     // Get list of users being followed
-    const followingIds = await redis.smembers(`user:${userId}:following`);
+    const followingIds = await trackedRedis.smembers(`user:${userId}:following`);
 
     console.log(`User ${userId} follows ${followingIds.length} users`);
 
@@ -378,6 +475,10 @@ app.get("/feed/following", async (req, res) => {
         }
       };
       setCache(cacheKey, response, 30);
+      const duration = Date.now() - startTime;
+      const counter = getRedisCounter(requestId);
+      console.log(`✅ [GET /feed/following] Success (empty) | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips`);
+      cleanupRedisCounter(requestId);
       return res.json(response);
     }
 
@@ -386,7 +487,7 @@ app.get("/feed/following", async (req, res) => {
 
     // Verify existence of user:{id}:posts keys by checking a sample
     const sampleKey = userPostKeys[0];
-    const sampleExists = await redis.exists(sampleKey);
+    const sampleExists = await trackedRedis.exists(sampleKey);
 
     let posts = [];
 
@@ -402,7 +503,7 @@ app.get("/feed/following", async (req, res) => {
       // Continue fetching until we have enough posts or run out of items
       while (posts.length < limit) {
         const bufferSize = limit * bufferMultiplier;
-        const explorePosts = await redis.zrevrange("explore:feed", currentOffset, currentOffset + bufferSize - 1);
+        const explorePosts = await trackedRedis.zrevrange("explore:feed", currentOffset, currentOffset + bufferSize - 1);
 
         console.log(`Fetched ${explorePosts.length} posts from explore:feed at offset ${currentOffset}`);
 
@@ -410,7 +511,7 @@ app.get("/feed/following", async (req, res) => {
         if (explorePosts.length === 0) break;
 
         // Pipeline to get user_id for each post
-        const pipeline = redis.pipeline();
+        const pipeline = trackedRedis.pipeline();
         for (const postId of explorePosts) {
           pipeline.hget(`post:${postId}`, "user_id");
         }
@@ -433,7 +534,7 @@ app.get("/feed/following", async (req, res) => {
 
         // Aggregate the filtered posts
         if (filteredPostIds.length > 0) {
-          const aggregated = await aggregatePostsWithUsers(filteredPostIds);
+          const aggregated = await aggregatePostsWithUsers(filteredPostIds, requestId);
           posts.push(...aggregated);
         }
 
@@ -454,10 +555,10 @@ app.get("/feed/following", async (req, res) => {
     } else {
       // Use ZUNIONSTORE to merge all followed users' posts into temporary sorted set
       const tmpKey = `tmp:home:${userId}`;
-      await redis.zunionstore(tmpKey, userPostKeys.length, ...userPostKeys);
+      await trackedRedis.zunionstore(tmpKey, userPostKeys.length, ...userPostKeys);
 
       // Set short expiration (15 seconds)
-      await redis.expire(tmpKey, 15);
+      await trackedRedis.expire(tmpKey, 15);
 
       console.log(`Created temporary union set ${tmpKey}`);
 
@@ -468,7 +569,7 @@ app.get("/feed/following", async (req, res) => {
 
       // Continue fetching until we have enough posts or run out of items
       while (posts.length < limit) {
-        const fetchedIds = await redis.zrevrange(tmpKey, currentOffset, currentOffset + bufferSize - 1);
+        const fetchedIds = await trackedRedis.zrevrange(tmpKey, currentOffset, currentOffset + bufferSize - 1);
 
         console.log(`Fetched ${fetchedIds.length} post IDs from ${tmpKey} at offset ${currentOffset}`);
 
@@ -476,7 +577,7 @@ app.get("/feed/following", async (req, res) => {
         if (fetchedIds.length === 0) break;
 
         // Aggregate posts with user data
-        const aggregated = await aggregatePostsWithUsers(fetchedIds);
+        const aggregated = await aggregatePostsWithUsers(fetchedIds, requestId);
         posts.push(...aggregated);
 
         // If we've collected enough posts, trim to exact limit
@@ -504,9 +605,18 @@ app.get("/feed/following", async (req, res) => {
     // Cache the result for 30 seconds
     setCache(cacheKey, response, 30);
 
+    const duration = Date.now() - startTime;
+    const counter = getRedisCounter(requestId);
+    console.log(`✅ [GET /feed/following] Success | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips`);
+    cleanupRedisCounter(requestId);
+
     res.json(response);
   } catch (err) {
     console.error("Error fetching following feed:", err);
+    const duration = Date.now() - startTime;
+    const counter = getRedisCounter(requestId);
+    console.log(`❌ [GET /feed/following] Error | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines`);
+    cleanupRedisCounter(requestId);
     res.status(500).json({ error: "Failed to fetch following feed" });
   }
 });
