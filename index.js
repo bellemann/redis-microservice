@@ -94,7 +94,12 @@ app.post("/", async (req, res) => {
       console.log("Redis returned:", result);
       console.log("-------------------------------");
 
-      results.push(result);
+      results.push({
+        command: cmd,
+        original: args,
+        resolved: argsProcessed,
+        result
+      });
     } catch (err) {
       console.error("Redis error:", err);
       results.push(`ERR ${err.message}`);
@@ -104,7 +109,24 @@ app.post("/", async (req, res) => {
   res.json(results);
 });
 
-// ===== DEBUG ENDPOINT =====
+// ===== EXTRA DEBUG ENDPOINT: SEE WHAT USER:AUTH RESOLVES TO =====
+app.get("/debug-auth", async (req, res) => {
+  try {
+    const tokenUserId = req.user.user_id;
+    const resolvedKey = `user:${tokenUserId}`;
+    const data = await redis.hgetall(resolvedKey);
+
+    res.json({
+      user_id: tokenUserId,
+      resolved_key: resolvedKey,
+      redis_data: data
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== EXISTING DEBUG ENDPOINT =====
 app.get("/debug/:key", async (req, res) => {
   try {
     const key =
@@ -127,4 +149,6 @@ process.on("unhandledRejection", (err) =>
 
 // ===== Start Server =====
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`Server running on port ${PORT}`)
+);
