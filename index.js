@@ -27,12 +27,14 @@ app.use((req, res, next) => {
   }
 });
 
-// ====== READ‑ONLY, UPSTASH‑STYLE ENDPOINT ======
+// ===== READ‑ONLY UPSTASH‑STYLE ENDPOINT =====
 app.post("/", async (req, res) => {
   let commands = req.body;
   if (!Array.isArray(commands)) {
     if (Array.isArray(req.body.commands)) commands = req.body.commands;
-    else return res.status(400).json({ error: "Body must be an array of Redis commands" });
+    else return res
+      .status(400)
+      .json({ error: "Body must be an array of Redis commands" });
   }
 
   const results = [];
@@ -41,20 +43,25 @@ app.post("/", async (req, res) => {
   for (const [cmdRaw, ...args] of commands) {
     const cmd = cmdRaw.toUpperCase();
 
-    // disallow write ops
-    const writeCommands = ["SET","DEL","HSET","HINCRBY","ZADD","ZREM","INCR","DECR","MSET","APPEND","EXPIRE"];
+    // Block write operations
+    const writeCommands = [
+      "SET", "DEL", "HSET", "HINCRBY", "ZADD",
+      "ZREM", "INCR", "DECR", "MSET", "APPEND", "EXPIRE"
+    ];
     if (writeCommands.includes(cmd)) {
       results.push("ERR read‑only mode");
       continue;
     }
 
     try {
-      // replace user:AUTH everywhere
-      const argsProcessed = args.map((a) =>
-        typeof a === "string" ? a.replace("user:AUTH", `user:${tokenUserId}`) : a
+      // Replace user:AUTH placeholders
+      const argsProcessed = args.map(a =>
+        typeof a === "string"
+          ? a.replace("user:AUTH", `user:${tokenUserId}`)
+          : a
       );
 
-      // restrict private keys
+      // Restrict “user:<id>:following” access
       if (
         argsProcessed.length > 0 &&
         typeof argsProcessed[0] === "string" &&
@@ -77,10 +84,10 @@ app.post("/", async (req, res) => {
   res.json(results);
 });
 
-// ===== Error visibility helpers =====
-process.on("uncaughtException", (err) => console.error("Uncaught:", err));
-process.on("unhandledRejection", (err) => console.error("Unhandled:", err));
+// ===== Crash logging =====
+process.on("uncaughtException", err => console.error("Uncaught:", err));
+process.on("unhandledRejection", err => console.error("Unhandled:", err));
 
-// ===== Start server (Bunny expects 8080) =====
+// ===== Start Server =====
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
