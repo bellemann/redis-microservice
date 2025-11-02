@@ -7,6 +7,6 @@ COPY . .
 
 # Bunny expects the container to listen on the internal port specified in the dashboard
 # Keep 8080 as the default
-EXPOSE 8080
+EXPOSE 3000
 
 CMD ["npm", "start"]
