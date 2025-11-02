@@ -146,17 +146,18 @@ app.get("/feed/explore", async (req, res) => {
   try {
     const offset = parseInt(req.query.offset) || 0;
     let limit = parseInt(req.query.limit) || 20;
+    const includeUser = req.query.includeUser !== 'false'; // default true
 
     // Validate and cap limit at 100
     if (limit > 100) limit = 100;
 
-    const cacheKey = `explore_feed_${offset}_${limit}`;
+    const cacheKey = `explore_feed_${offset}_${limit}_${includeUser}`;
 
     // Check cache first
     const cached = getCached(cacheKey);
     if (cached) {
       const duration = Date.now() - startTime;
-      console.log(`✅ [GET /feed/explore] CACHE HIT | Duration: ${duration}ms | Redis: 0 commands, 0 pipelines`);
+      console.log(`✅ [GET /feed/explore] CACHE HIT | Duration: ${duration}ms | Redis: 0 commands, 0 pipelines | includeUser: ${includeUser}`);
       cleanupRedisCounter(requestId);
       return res.json(cached);
     }
@@ -184,8 +185,8 @@ app.get("/feed/explore", async (req, res) => {
       // No more posts available
       if (postIds.length === 0) break;
 
-      // Aggregate posts with user data
-      const aggregated = await aggregatePostsWithUsers(postIds, requestId);
+      // Aggregate posts with optional user data
+      const aggregated = await aggregatePostsWithUsers(postIds, requestId, includeUser);
       posts.push(...aggregated);
 
       // If we've collected enough posts, trim to exact limit
@@ -214,7 +215,7 @@ app.get("/feed/explore", async (req, res) => {
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
-    console.log(`✅ [GET /feed/explore] Success | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips`);
+    console.log(`✅ [GET /feed/explore] Success | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips | includeUser: ${includeUser}`);
     cleanupRedisCounter(requestId);
 
     res.json(response);
@@ -257,10 +258,10 @@ app.use((req, res, next) => {
 });
 
 // ===== Helper: Aggregate posts with user data =====
-async function aggregatePostsWithUsers(postIds, requestId) {
+async function aggregatePostsWithUsers(postIds, requestId, includeUser = true) {
   if (postIds.length === 0) return [];
 
-  console.log(`[aggregatePostsWithUsers] Processing ${postIds.length} post IDs`);
+  console.log(`[aggregatePostsWithUsers] Processing ${postIds.length} post IDs (includeUser: ${includeUser})`);
 
   const trackedRedis = createTrackedRedis(requestId);
 
@@ -285,7 +286,8 @@ async function aggregatePostsWithUsers(postIds, requestId) {
     }
     posts.push(postData);
 
-    if (postData.user_id) {
+    // Only fetch users if includeUser is true
+    if (includeUser && postData.user_id) {
       // Check user cache first
       const cachedUser = getUserCached(postData.user_id);
       if (cachedUser) {
@@ -298,47 +300,56 @@ async function aggregatePostsWithUsers(postIds, requestId) {
   }
 
   console.log(`[aggregatePostsWithUsers] Found ${posts.filter(p => p).length} valid posts`);
-  console.log(`[aggregatePostsWithUsers] ${Object.keys(userMap).length} users from cache, ${userIds.size} users to fetch`);
 
-  // Second pipeline: Fetch uncached users
-  if (userIds.size > 0) {
-    const userPipeline = trackedRedis.pipeline();
-    const userIdArray = Array.from(userIds);
+  if (includeUser) {
+    console.log(`[aggregatePostsWithUsers] ${Object.keys(userMap).length} users from cache, ${userIds.size} users to fetch`);
 
-    for (const userId of userIdArray) {
-      userPipeline.hgetall(`user:${userId}`);
-    }
-    const userResults = await userPipeline.exec();
+    // Second pipeline: Fetch uncached users
+    if (userIds.size > 0) {
+      const userPipeline = trackedRedis.pipeline();
+      const userIdArray = Array.from(userIds);
 
-    // Build map of user_id -> userData and cache them
-    for (let i = 0; i < userIdArray.length; i++) {
-      const userId = userIdArray[i];
-      const [, userData] = userResults[i];
-      const userDataObj = userData || {};
+      for (const userId of userIdArray) {
+        userPipeline.hgetall(`user:${userId}`);
+      }
+      const userResults = await userPipeline.exec();
 
-      console.log(`[aggregatePostsWithUsers] Fetched user ${userId}:`, Object.keys(userDataObj).length > 0 ? Object.keys(userDataObj) : 'EMPTY');
+      // Build map of user_id -> userData and cache them
+      for (let i = 0; i < userIdArray.length; i++) {
+        const userId = userIdArray[i];
+        const [, userData] = userResults[i];
+        const userDataObj = userData || {};
 
-      userMap[userId] = userDataObj;
-      // Cache user data for 5 minutes
-      setUserCache(userId, userDataObj, 300);
+        console.log(`[aggregatePostsWithUsers] Fetched user ${userId}:`, Object.keys(userDataObj).length > 0 ? Object.keys(userDataObj) : 'EMPTY');
+
+        userMap[userId] = userDataObj;
+        // Cache user data for 5 minutes
+        setUserCache(userId, userDataObj, 300);
+      }
     }
   }
 
-  // Iterate original postIds order and push { post, user }
+  // Iterate original postIds order and push results
   const results = [];
   for (const postData of posts) {
     if (!postData) continue;
 
-    // If post has user_id, attach user data (even if empty)
-    const userData = postData.user_id ? (userMap[postData.user_id] || {}) : {};
-
-    results.push({
-      post: postData,
-      user: userData
-    });
+    if (includeUser) {
+      // Include user data
+      const userData = postData.user_id ? (userMap[postData.user_id] || {}) : {};
+      results.push({
+        post: postData,
+        user: userData
+      });
+    } else {
+      // Only post data, no user
+      results.push({
+        post: postData
+      });
+    }
   }
 
-  console.log(`[aggregatePostsWithUsers] Returning ${results.length} aggregated posts with users`);
+  console.log(`[aggregatePostsWithUsers] Returning ${results.length} aggregated posts${includeUser ? ' with users' : ' (no users)'}`);
   return results;
 }
 
@@ -441,17 +452,18 @@ app.get("/feed/following", async (req, res) => {
     const userId = req.user.user_id;
     const offset = parseInt(req.query.offset) || 0;
     let limit = parseInt(req.query.limit) || 20;
+    const includeUser = req.query.includeUser !== 'false'; // default true
 
     // Validate and cap limit at 100
     if (limit > 100) limit = 100;
 
-    const cacheKey = `following_feed_${userId}_${offset}_${limit}`;
+    const cacheKey = `following_feed_${userId}_${offset}_${limit}_${includeUser}`;
 
     // Check cache first
     const cached = getCached(cacheKey);
     if (cached) {
       const duration = Date.now() - startTime;
-      console.log(`✅ [GET /feed/following] CACHE HIT | Duration: ${duration}ms | Redis: 0 commands, 0 pipelines`);
+      console.log(`✅ [GET /feed/following] CACHE HIT | Duration: ${duration}ms | Redis: 0 commands, 0 pipelines | includeUser: ${includeUser}`);
       cleanupRedisCounter(requestId);
       return res.json(cached);
     }
@@ -477,7 +489,7 @@ app.get("/feed/following", async (req, res) => {
       setCache(cacheKey, response, 30);
       const duration = Date.now() - startTime;
       const counter = getRedisCounter(requestId);
-      console.log(`✅ [GET /feed/following] Success (empty) | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips`);
+      console.log(`✅ [GET /feed/following] Success (empty) | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips | includeUser: ${includeUser}`);
       cleanupRedisCounter(requestId);
       return res.json(response);
     }
@@ -534,7 +546,7 @@ app.get("/feed/following", async (req, res) => {
 
         // Aggregate the filtered posts
         if (filteredPostIds.length > 0) {
-          const aggregated = await aggregatePostsWithUsers(filteredPostIds, requestId);
+          const aggregated = await aggregatePostsWithUsers(filteredPostIds, requestId, includeUser);
           posts.push(...aggregated);
         }
 
@@ -577,7 +589,7 @@ app.get("/feed/following", async (req, res) => {
         if (fetchedIds.length === 0) break;
 
         // Aggregate posts with user data
-        const aggregated = await aggregatePostsWithUsers(fetchedIds, requestId);
+        const aggregated = await aggregatePostsWithUsers(fetchedIds, requestId, includeUser);
         posts.push(...aggregated);
 
         // If we've collected enough posts, trim to exact limit
@@ -607,7 +619,7 @@ app.get("/feed/following", async (req, res) => {
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
-    console.log(`✅ [GET /feed/following] Success | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips`);
+    console.log(`✅ [GET /feed/following] Success | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips | includeUser: ${includeUser}`);
     cleanupRedisCounter(requestId);
 
     res.json(response);
@@ -615,7 +627,7 @@ app.get("/feed/following", async (req, res) => {
     console.error("Error fetching following feed:", err);
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
-    console.log(`❌ [GET /feed/following] Error | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines`);
+    console.log(`❌ [GET /feed/following] Error | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | includeUser: ${includeUser}`);
     cleanupRedisCounter(requestId);
     res.status(500).json({ error: "Failed to fetch following feed" });
   }

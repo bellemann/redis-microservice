@@ -104,6 +104,7 @@ Returns posts from the global `explore:feed` sorted set (newest first).
 **Query Parameters:**
 - `offset` (optional, default: 0) - Pagination offset
 - `limit` (optional, default: 20, max: 100) - Number of posts to return
+- `includeUser` (optional, default: true) - Include user data with posts. Set to `false` to return only post data without user information
 
 **Response Format:**
 ```json
@@ -137,7 +138,11 @@ Returns posts from the global `explore:feed` sorted set (newest first).
 
 **Example Request:**
 ```bash
+# With user data (default)
 curl "http://localhost:3000/feed/explore?offset=0&limit=10"
+
+# Without user data (faster, less data)
+curl "http://localhost:3000/feed/explore?offset=0&limit=10&includeUser=false"
 ```
 
 ### GET /feed/following
@@ -149,6 +154,7 @@ Returns posts from users that the authenticated user follows, sorted by date (ne
 **Query Parameters:**
 - `offset` (optional, default: 0) - Pagination offset
 - `limit` (optional, default: 20, max: 100) - Number of posts to return
+- `includeUser` (optional, default: true) - Include user data with posts. Set to `false` to return only post data without user information
 
 **Response Format:**
 ```json
@@ -184,8 +190,13 @@ Returns posts from users that the authenticated user follows, sorted by date (ne
 
 **Example Request:**
 ```bash
+# With user data (default)
 curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
   "http://localhost:3000/feed/following?offset=0&limit=10"
+
+# Without user data (faster, less data)
+curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  "http://localhost:3000/feed/following?offset=0&limit=10&includeUser=false"
 ```
 
 ## Redis Data Structure
