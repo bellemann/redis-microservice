@@ -155,6 +155,8 @@ app.use((req, res, next) => {
 async function aggregatePostsWithUsers(postIds) {
   if (postIds.length === 0) return [];
 
+  console.log(`[aggregatePostsWithUsers] Processing ${postIds.length} post IDs`);
+
   // First pipeline: Fetch all posts
   const postPipeline = redis.pipeline();
   for (const postId of postIds) {
@@ -168,13 +170,19 @@ async function aggregatePostsWithUsers(postIds) {
 
   for (let i = 0; i < postIds.length; i++) {
     const [err, postData] = postResults[i];
-    if (err || !postData || !postData.user_id) {
+    if (err || !postData || Object.keys(postData).length === 0) {
+      console.log(`[aggregatePostsWithUsers] Skipping post ${postIds[i]}: empty or error`);
       posts.push(null);
       continue;
     }
+    // Keep post even if user_id is missing - we'll handle it later
     posts.push(postData);
-    userIds.add(postData.user_id);
+    if (postData.user_id) {
+      userIds.add(postData.user_id);
+    }
   }
+
+  console.log(`[aggregatePostsWithUsers] Found ${posts.filter(p => p).length} valid posts, ${userIds.size} unique users`);
 
   // Second pipeline: Fetch all unique users
   const userPipeline = redis.pipeline();
@@ -184,28 +192,29 @@ async function aggregatePostsWithUsers(postIds) {
   }
   const userResults = await userPipeline.exec();
 
-  // Build map of user_id -> userData
+  // Build map of user_id -> userData (keep even if empty)
   const userMap = {};
   for (let i = 0; i < userIdArray.length; i++) {
-    const [err, userData] = userResults[i];
-    if (!err && userData && Object.keys(userData).length > 0) {
-      userMap[userIdArray[i]] = userData;
-    }
+    const [, userData] = userResults[i];
+    // Don't filter out empty users - just use what we have
+    userMap[userIdArray[i]] = userData || {};
   }
 
-  // Iterate original postIds order and push { post, user } only when both exist
+  // Iterate original postIds order and push { post, user }
   const results = [];
   for (const postData of posts) {
     if (!postData) continue;
-    const userData = userMap[postData.user_id];
-    if (!userData) continue;
+
+    // If post has user_id, attach user data (even if empty)
+    const userData = postData.user_id ? userMap[postData.user_id] : {};
 
     results.push({
       post: postData,
-      user: userData
+      user: userData || {}
     });
   }
 
+  console.log(`[aggregatePostsWithUsers] Returning ${results.length} aggregated posts`);
   return results;
 }
 
