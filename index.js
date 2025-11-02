@@ -1,3 +1,4 @@
+console.log("=== BUILD VERSION: debug-auth test build ===");
 import express from "express";
 import cors from "cors";
 import Redis from "ioredis";
