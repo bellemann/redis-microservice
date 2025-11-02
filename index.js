@@ -16,6 +16,7 @@ const redis = new Redis(process.env.REDIS_URL, { enableReadyCheck: false });
 
 // ===== In-Memory Cache =====
 const cache = {};
+const userCache = {}; // Separate aggressive cache for user data
 
 function getCached(key) {
   const entry = cache[key];
@@ -29,6 +30,23 @@ function getCached(key) {
 
 function setCache(key, data, ttlSeconds = 30) {
   cache[key] = {
+    data,
+    expires: Date.now() + ttlSeconds * 1000
+  };
+}
+
+function getUserCached(userId) {
+  const entry = userCache[userId];
+  if (!entry) return null;
+  if (Date.now() > entry.expires) {
+    delete userCache[userId];
+    return null;
+  }
+  return entry.data;
+}
+
+function setUserCache(userId, data, ttlSeconds = 300) { // 5 minutes default for users
+  userCache[userId] = {
     data,
     expires: Date.now() + ttlSeconds * 1000
   };
@@ -164,9 +182,10 @@ async function aggregatePostsWithUsers(postIds) {
   }
   const postResults = await postPipeline.exec();
 
-  // Collect user_id values and build unique set
+  // Collect user_id values and build unique set, check cache first
   const userIds = new Set();
   const posts = [];
+  const userMap = {};
 
   for (let i = 0; i < postIds.length; i++) {
     const [err, postData] = postResults[i];
@@ -175,29 +194,45 @@ async function aggregatePostsWithUsers(postIds) {
       posts.push(null);
       continue;
     }
-    // Keep post even if user_id is missing - we'll handle it later
     posts.push(postData);
+
     if (postData.user_id) {
-      userIds.add(postData.user_id);
+      // Check user cache first
+      const cachedUser = getUserCached(postData.user_id);
+      if (cachedUser) {
+        console.log(`[aggregatePostsWithUsers] Cache HIT for user ${postData.user_id}`);
+        userMap[postData.user_id] = cachedUser;
+      } else {
+        userIds.add(postData.user_id);
+      }
     }
   }
 
-  console.log(`[aggregatePostsWithUsers] Found ${posts.filter(p => p).length} valid posts, ${userIds.size} unique users`);
+  console.log(`[aggregatePostsWithUsers] Found ${posts.filter(p => p).length} valid posts`);
+  console.log(`[aggregatePostsWithUsers] ${Object.keys(userMap).length} users from cache, ${userIds.size} users to fetch`);
 
-  // Second pipeline: Fetch all unique users
-  const userPipeline = redis.pipeline();
-  const userIdArray = Array.from(userIds);
-  for (const userId of userIdArray) {
-    userPipeline.hgetall(`user:${userId}`);
-  }
-  const userResults = await userPipeline.exec();
+  // Second pipeline: Fetch uncached users
+  if (userIds.size > 0) {
+    const userPipeline = redis.pipeline();
+    const userIdArray = Array.from(userIds);
 
-  // Build map of user_id -> userData (keep even if empty)
-  const userMap = {};
-  for (let i = 0; i < userIdArray.length; i++) {
-    const [, userData] = userResults[i];
-    // Don't filter out empty users - just use what we have
-    userMap[userIdArray[i]] = userData || {};
+    for (const userId of userIdArray) {
+      userPipeline.hgetall(`user:${userId}`);
+    }
+    const userResults = await userPipeline.exec();
+
+    // Build map of user_id -> userData and cache them
+    for (let i = 0; i < userIdArray.length; i++) {
+      const userId = userIdArray[i];
+      const [, userData] = userResults[i];
+      const userDataObj = userData || {};
+
+      console.log(`[aggregatePostsWithUsers] Fetched user ${userId}:`, Object.keys(userDataObj).length > 0 ? Object.keys(userDataObj) : 'EMPTY');
+
+      userMap[userId] = userDataObj;
+      // Cache user data for 5 minutes
+      setUserCache(userId, userDataObj, 300);
+    }
   }
 
   // Iterate original postIds order and push { post, user }
@@ -206,15 +241,15 @@ async function aggregatePostsWithUsers(postIds) {
     if (!postData) continue;
 
     // If post has user_id, attach user data (even if empty)
-    const userData = postData.user_id ? userMap[postData.user_id] : {};
+    const userData = postData.user_id ? (userMap[postData.user_id] || {}) : {};
 
     results.push({
       post: postData,
-      user: userData || {}
+      user: userData
     });
   }
 
-  console.log(`[aggregatePostsWithUsers] Returning ${results.length} aggregated posts`);
+  console.log(`[aggregatePostsWithUsers] Returning ${results.length} aggregated posts with users`);
   return results;
 }
 
