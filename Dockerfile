@@ -1,12 +1,12 @@
 FROM node:20-alpine
-
 WORKDIR /app
+
+# Copy only package files first → cached layer
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
+
+# Now copy the rest
 COPY . .
 
-# Bunny expects the container to listen on the internal port specified in the dashboard
-# Keep 8080 as the default
 EXPOSE 3000
-
 CMD ["npm", "start"]
