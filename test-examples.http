@@ -185,3 +185,74 @@ x-authorization: {{token}}
 ### Using x-access-token header
 POST {{baseUrl}}/whoami
 x-access-token: {{token}}
+
+###############################################################################
+# FEED ENDPOINTS
+###############################################################################
+
+### GET /feed/explore - Explore feed (first page, default pagination)
+# Returns posts from the global explore:feed sorted set
+# Response: { posts: [{ post: {...}, user: {...} }], pagination: { offset, limit, count } }
+GET {{baseUrl}}/feed/explore
+Authorization: Bearer {{token}}
+
+### GET /feed/explore - Explore feed with custom pagination (first 10 posts)
+GET {{baseUrl}}/feed/explore?offset=0&limit=10
+Authorization: Bearer {{token}}
+
+### GET /feed/explore - Explore feed (second page, posts 11-20)
+GET {{baseUrl}}/feed/explore?offset=10&limit=10
+Authorization: Bearer {{token}}
+
+### GET /feed/explore - Explore feed (only 5 posts)
+GET {{baseUrl}}/feed/explore?limit=5
+Authorization: Bearer {{token}}
+
+### GET /feed/following - Following feed (first page, default pagination)
+# Returns posts from users that the authenticated user follows
+# User-specific based on JWT user_id
+# Response: { posts: [{ post: {...}, user: {...} }], pagination: { offset, limit, count } }
+GET {{baseUrl}}/feed/following
+Authorization: Bearer {{token}}
+
+### GET /feed/following - Following feed with custom pagination (first 10 posts)
+GET {{baseUrl}}/feed/following?offset=0&limit=10
+Authorization: Bearer {{token}}
+
+### GET /feed/following - Following feed (second page, posts 11-20)
+GET {{baseUrl}}/feed/following?offset=10&limit=10
+Authorization: Bearer {{token}}
+
+### GET /feed/following - Following feed (only 5 posts)
+GET {{baseUrl}}/feed/following?limit=5
+Authorization: Bearer {{token}}
+
+###############################################################################
+# FEED ENDPOINTS - EXPECTED RESPONSE FORMAT
+###############################################################################
+
+# Example response structure for feed endpoints:
+# {
+#   "posts": [
+#     {
+#       "post": {
+#         "uuid": "post-uuid-123",
+#         "user_id": "user-uuid-456",
+#         "content": "Example post content",
+#         "created_at": "2025-11-02T10:30:00Z",
+#         ... (other post fields from Redis hash)
+#       },
+#       "user": {
+#         "uuid": "user-uuid-456",
+#         "username": "johndoe",
+#         "display_name": "John Doe",
+#         ... (other user fields from Redis hash)
+#       }
+#     }
+#   ],
+#   "pagination": {
+#     "offset": 0,
+#     "limit": 20,
+#     "count": 15
+#   }
+# }

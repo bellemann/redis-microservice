@@ -38,12 +38,14 @@ PORT=3000
 - **`GET /`** - Welcome message and service info
 - **`GET /ping`** - Simple health check, returns "pong"
 - **`GET /healthz`** - Health status check
+- **`GET /feed/explore`** - Explore feed (public posts, paginated)
 
 ### Protected Routes (JWT Authentication Required)
 
 - **`POST /`** - Redis proxy endpoint for executing Redis commands
 - **`GET/POST /whoami`** - Returns the decoded JWT payload
 - **`GET/POST /debug-auth`** - Tests Redis key resolution with placeholder replacement
+- **`GET /feed/following`** - Following feed (posts from followed users, paginated)
 
 ## JWT Authentication
 
@@ -88,6 +90,133 @@ The service automatically replaces `user:AUTH` with `user:{user_id}` in Redis co
 - Resolves to: `["GET", "user:123:following"]` (if user_id is "123")
 
 This allows clients to query their own data without knowing their user_id in advance.
+
+## Feed Endpoints
+
+The service provides two feed endpoints for retrieving posts with user data.
+
+### GET /feed/explore
+
+Returns posts from the global `explore:feed` sorted set (newest first).
+
+**Authentication:** None required - this is a public endpoint.
+
+**Query Parameters:**
+- `offset` (optional, default: 0) - Pagination offset
+- `limit` (optional, default: 20, max: 100) - Number of posts to return
+
+**Response Format:**
+```json
+{
+  "posts": [
+    {
+      "post": {
+        "uuid": "post-uuid-123",
+        "user_id": "user-uuid-456",
+        "content": "Example post content",
+        "created_at": "2025-11-02T10:30:00Z"
+      },
+      "user": {
+        "uuid": "user-uuid-456",
+        "username": "johndoe",
+        "display_name": "John Doe"
+      }
+    }
+  ],
+  "pagination": {
+    "offset": 0,
+    "limit": 20,
+    "count": 15
+  }
+}
+```
+
+**Caching:** Results are cached for 30 seconds to improve performance.
+
+**Pagination Buffer:** Automatically fetches additional posts to ensure full pages even when some posts/users are missing.
+
+**Example Request:**
+```bash
+curl "http://localhost:3000/feed/explore?offset=0&limit=10"
+```
+
+### GET /feed/following
+
+Returns posts from users that the authenticated user follows, sorted by date (newest first).
+
+**Authentication:** Requires JWT token. The `user_id` is extracted from the token to determine which users are followed.
+
+**Query Parameters:**
+- `offset` (optional, default: 0) - Pagination offset
+- `limit` (optional, default: 20, max: 100) - Number of posts to return
+
+**Response Format:**
+```json
+{
+  "posts": [
+    {
+      "post": {
+        "uuid": "post-uuid-123",
+        "user_id": "user-uuid-456",
+        "content": "Example post content",
+        "created_at": "2025-11-02T10:30:00Z"
+      },
+      "user": {
+        "uuid": "user-uuid-456",
+        "username": "johndoe",
+        "display_name": "John Doe"
+      }
+    }
+  ],
+  "pagination": {
+    "offset": 0,
+    "limit": 20,
+    "count": 15
+  }
+}
+```
+
+**Caching:** Results are cached for 30 seconds per user (user-specific cache).
+
+**Pagination Buffer:** Automatically fetches additional posts to ensure full pages even when some posts/users are missing.
+
+**Optimization:** Uses Redis `ZUNIONSTORE` to efficiently merge posts from all followed users, with fallback to `explore:feed` filtering if `user:{uuid}:posts` structures are not available.
+
+**Example Request:**
+```bash
+curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  "http://localhost:3000/feed/following?offset=0&limit=10"
+```
+
+## Redis Data Structure
+
+The feed endpoints expect the following Redis key structure:
+
+- **`explore:feed`** - Sorted Set (Score = Timestamp, Member = Post UUID)
+  - Contains post UUIDs for the global explore feed
+  - Higher scores (timestamps) represent newer posts
+
+- **`post:{uuid}`** - Hash
+  - Contains post data including `user_id`, `content`, `created_at`, etc.
+
+- **`user:{uuid}`** - Hash
+  - Contains user profile data including `username`, `display_name`, etc.
+
+- **`user:{uuid}:following`** - Set
+  - Contains user IDs that the user follows
+
+- **`user:{uuid}:posts`** - Sorted Set (Score = Timestamp, Member = Post UUID)
+  - Contains post UUIDs for a specific user
+  - **Required** for optimal following feed performance
+  - If absent, the service will fall back to filtering `explore:feed` by followed users (less efficient)
+
+## Performance Notes
+
+- **Caching**: Both feed endpoints implement 30-second in-memory caching to reduce Redis load
+- **Pagination Limit**: Maximum limit of 100 posts per request prevents excessive data transfer
+- **Following Feed Optimization**: Uses Redis `ZUNIONSTORE` to efficiently merge posts from multiple followed users into a temporary sorted set
+- **Fallback Mode**: If `user:{uuid}:posts` structures are missing, the following feed falls back to filtering `explore:feed`, which is less efficient but ensures functionality
+- **Cache Keys**: Cache keys include pagination parameters to ensure correct results for different page requests
 
 ## Security Features
 
