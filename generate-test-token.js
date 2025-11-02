@@ -29,19 +29,25 @@ if (!process.env.JWT_SECRET) {
 
 // Generate the JWT token
 const payload = {
-  user_id: userId,
-  iat: Math.floor(Date.now() / 1000)
+  user_id: userId
 };
 
-const token = jwt.sign(payload, process.env.JWT_SECRET);
+// Sign with 900 seconds (15 minutes) expiration
+const token = jwt.sign(payload, process.env.JWT_SECRET, {
+  expiresIn: 900
+});
+
+// Decode the token to show the full payload including exp
+const decoded = jwt.decode(token);
 
 // Output the results
 console.log('\n=== JWT Token Generated ===\n');
 console.log('User ID:', userId);
+console.log('Expires in: 900 seconds (15 minutes)');
 console.log('\nToken:');
 console.log(token);
 console.log('\n=== Decoded Payload ===\n');
-console.log(JSON.stringify(payload, null, 2));
+console.log(JSON.stringify(decoded, null, 2));
 console.log('\n=== Test with cURL ===\n');
 console.log('# Health check (no auth required)');
 console.log('curl http://localhost:3000/ping\n');

@@ -70,11 +70,14 @@ The JWT token must contain a `user_id` field:
 ```json
 {
   "user_id": "123",
-  "iat": 1234567890
+  "iat": 1234567890,
+  "exp": 1234568790
 }
 ```
 
 The token must be signed with the `JWT_SECRET` configured in your `.env` file.
+
+**Token Expiration:** Tokens expire after 900 seconds (15 minutes). The service automatically validates the expiration time.
 
 ## Placeholder Replacement
 
@@ -226,10 +229,17 @@ curl -X POST \
 ### 401 Unauthorized (Invalid Token)
 ```json
 {
-  "error": "Invalid token",
-  "details": "jwt malformed"
+  "error": "Invalid token"
 }
 ```
+
+### 401 Unauthorized (Expired Token)
+```json
+{
+  "error": "Invalid token"
+}
+```
+Note: Tokens expire after 15 minutes (900 seconds).
 
 ### 403 Forbidden (Access to Other User's Data)
 ```json
