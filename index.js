@@ -37,8 +37,8 @@ app.post("/", async (req, res) => {
       .json({ error: "Body must be an array of Redis commands" });
   }
 
-  const results = [];
-  const tokenUserId = parseInt(req.user.user_id, 10);
+ const results = [];
+const tokenUserId = req.user.user_id; // UUID or numeric — works for both
 
   for (const [cmdRaw, ...args] of commands) {
     const cmd = cmdRaw.toUpperCase();
@@ -63,16 +63,16 @@ app.post("/", async (req, res) => {
 
       // Restrict “user:<id>:following” access
       if (
-        argsProcessed.length > 0 &&
-        typeof argsProcessed[0] === "string" &&
-        /^user:\d+:following$/.test(argsProcessed[0])
-      ) {
-        const idInKey = parseInt(argsProcessed[0].split(":")[1], 10);
-        if (idInKey !== tokenUserId) {
-          results.push("ERR forbidden: private resource");
-          continue;
-        }
-      }
+  argsProcessed.length > 0 &&
+  typeof argsProcessed[0] === "string" &&
+  /^user:[\w-]+:following$/.test(argsProcessed[0])
+) {
+  const idInKey = argsProcessed[0].split(":")[1];
+  if (idInKey !== tokenUserId) {
+    results.push("ERR forbidden: private resource");
+    continue;
+  }
+}
 
       const result = await redis[cmd.toLowerCase()](...argsProcessed);
       results.push(result);
