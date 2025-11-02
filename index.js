@@ -89,5 +89,5 @@ process.on("uncaughtException", err => console.error("Uncaught:", err));
 process.on("unhandledRejection", err => console.error("Unhandled:", err));
 
 // ===== Start Server =====
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
