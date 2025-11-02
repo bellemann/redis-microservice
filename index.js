@@ -10,7 +10,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const redis = new Redis(process.env.REDIS_URL);
+// disable ready check to avoid NOPERM warning
+const redis = new Redis(process.env.REDIS_URL, { enableReadyCheck: false });
 
 // ===== JWT AUTH MIDDLEWARE =====
 app.use((req, res, next) => {
@@ -27,7 +28,7 @@ app.use((req, res, next) => {
   }
 });
 
-// ===== READ‑ONLY UPSTASH‑STYLE ENDPOINT =====
+// ===== READ‑ONLY REDIS ENDPOINT =====
 app.post("/", async (req, res) => {
   let commands = req.body;
   if (!Array.isArray(commands)) {
@@ -39,12 +40,12 @@ app.post("/", async (req, res) => {
   }
 
   const results = [];
-  const tokenUserId = req.user.user_id; // UUID or numeric — works for both
+  const tokenUserId = req.user.user_id; // works for UUID or numeric
 
   for (const [cmdRaw, ...args] of commands) {
     const cmd = cmdRaw.toUpperCase();
 
-    // Block write operations
+    // Prevent writes
     const writeCommands = [
       "SET",
       "DEL",
@@ -64,12 +65,12 @@ app.post("/", async (req, res) => {
     }
 
     try {
-      // Replace user:AUTH placeholders
+      // Replace user:AUTH with real key
       const argsProcessed = args.map((a) =>
         typeof a === "string" ? a.replace("user:AUTH", `user:${tokenUserId}`) : a
       );
 
-      // Restrict “user:<id>:following” access
+      // Restrict user:<id>:following to owner only
       if (
         argsProcessed.length > 0 &&
         typeof argsProcessed[0] === "string" &&
@@ -82,24 +83,34 @@ app.post("/", async (req, res) => {
         }
       }
 
-      // ===== DEBUG LOGGING =====
-      console.log("------------ DEBUG ------------");
-      console.log("Token user_id:", req.user.user_id);
-      console.log("Raw command:", cmdRaw);
+      // Block reading sensitive keys (otp:*, session*)
+      if (
+        argsProcessed.length > 0 &&
+        typeof argsProcessed[0] === "string"
+      ) {
+        const key = argsProcessed[0];
+        if (
+          /^otp:[\w-]+$/.test(key) ||
+          /^session[\w-]+$/.test(key)
+        ) {
+          results.push("ERR forbidden: private key");
+          continue;
+        }
+      }
+
+      // === DEBUG LOGGING ===
+      console.log("=== Redis Request ===");
+      console.log("JWT user_id:", req.user.user_id);
+      console.log("Command:", cmdRaw);
       console.log("Original args:", args);
       console.log("Resolved args:", argsProcessed);
 
       const result = await redis[cmd.toLowerCase()](...argsProcessed);
 
-      console.log("Redis returned:", result);
-      console.log("-------------------------------");
+      console.log("Redis result:", result);
+      console.log("=====================");
 
-      results.push({
-        command: cmd,
-        original: args,
-        resolved: argsProcessed,
-        result
-      });
+      results.push(result);
     } catch (err) {
       console.error("Redis error:", err);
       results.push(`ERR ${err.message}`);
@@ -109,12 +120,18 @@ app.post("/", async (req, res) => {
   res.json(results);
 });
 
-// ===== EXTRA DEBUG ENDPOINT: SEE WHAT USER:AUTH RESOLVES TO =====
+// ===== DEBUG AUTH ENDPOINT =====
 app.get("/debug-auth", async (req, res) => {
   try {
     const tokenUserId = req.user.user_id;
     const resolvedKey = `user:${tokenUserId}`;
     const data = await redis.hgetall(resolvedKey);
+
+    console.log("=== /debug-auth ===");
+    console.log("Token user_id:", tokenUserId);
+    console.log("Resolved key:", resolvedKey);
+    console.log("Redis data:", data);
+    console.log("===================");
 
     res.json({
       user_id: tokenUserId,
@@ -126,19 +143,12 @@ app.get("/debug-auth", async (req, res) => {
   }
 });
 
-// ===== EXISTING DEBUG ENDPOINT =====
-app.get("/debug/:key", async (req, res) => {
-  try {
-    const key =
-      req.params.key === "AUTH"
-        ? `user:${req.user.user_id}`
-        : req.params.key;
-
-    const data = await redis.hgetall(key);
-    res.json({ key, data });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// ===== Simple whoami check =====
+app.get("/whoami", (req, res) => {
+  res.json({
+    jwt_payload: req.user,
+    resolved_user_key: `user:${req.user.user_id}`
+  });
 });
 
 // ===== Crash logging =====
