@@ -74,8 +74,22 @@ const tokenUserId = req.user.user_id; // UUID or numeric — works for both
   }
 }
 
-      const result = await redis[cmd.toLowerCase()](...argsProcessed);
-      results.push(result);
+      console.log("------------ DEBUG ------------");
+console.log("Token user_id:", req.user.user_id);
+console.log("Raw command:", cmdRaw);
+console.log("Original args:", args);
+console.log("Resolved args:", argsProcessed);
+
+try {
+  const result = await redis[cmd.toLowerCase()](...argsProcessed);
+  console.log("Redis returned:", result);
+  results.push(result);
+} catch (err) {
+  console.error("Redis error:", err);
+  results.push(`ERR ${err.message}`);
+}
+
+console.log("-------------------------------");
     } catch (err) {
       results.push(`ERR ${err.message}`);
     }
