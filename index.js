@@ -304,7 +304,17 @@ app.use((req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    // Validate role field
+    const role = decoded.role;
+    const validRoles = ['admin', 'user', 'model'];
+    if (!role || !validRoles.includes(role)) {
+      return res.status(401).json({ error: "Invalid or missing role in token" });
+    }
+
+    // Assign validated role to req.user
     req.user = decoded;
+    req.user.role = role;
     next();
   } catch (e) {
     return res.status(401).json({ error: "Invalid token" });
@@ -537,6 +547,67 @@ app.post("/", async (req, res) => {
   }
 
   res.json(results);
+});
+
+// ===== GET /users/:id: Get user profile with privacy controls =====
+app.get("/users/:id", async (req, res) => {
+  const requestId = getRequestId();
+  initRedisCounter(requestId);
+  const startTime = Date.now();
+
+  try {
+    const userId = req.params.id;
+    const authenticatedUserId = req.user.user_id;
+
+    // Build viewer-specific cache key
+    const cacheKey = `user_profile_${userId}_${authenticatedUserId}`;
+
+    // Check cache first
+    const cached = getCached(cacheKey);
+    if (cached) {
+      const duration = Date.now() - startTime;
+      console.log(`✅ [GET /users/:id] CACHE HIT | Duration: ${duration}ms | Redis: 0 commands, 0 pipelines`);
+      cleanupRedisCounter(requestId);
+      return res.json(cached);
+    }
+
+    console.log(`[CACHE MISS] ${cacheKey}`);
+
+    const trackedRedis = createTrackedRedis(requestId);
+
+    // Fetch user data from Redis
+    const userData = await trackedRedis.hgetall(`user:${userId}`);
+
+    if (!userData || Object.keys(userData).length === 0) {
+      const duration = Date.now() - startTime;
+      const counter = getRedisCounter(requestId);
+      console.log(`❌ [GET /users/:id] User not found | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines`);
+      cleanupRedisCounter(requestId);
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Apply privacy controls
+    const sanitized = sanitizeUserData(userData, userId, authenticatedUserId);
+
+    const response = { user: sanitized };
+
+    // Cache the sanitized data for ~300s
+    setCache(cacheKey, response, 300);
+
+    const duration = Date.now() - startTime;
+    const counter = getRedisCounter(requestId);
+    console.log(`✅ [GET /users/:id] Success | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines | Total: ${counter.commands + counter.pipelines} roundtrips`);
+    cleanupRedisCounter(requestId);
+
+    res.json(response);
+  } catch (err) {
+    console.error("Error fetching user profile:", err);
+    const duration = Date.now() - startTime;
+    const counter = getRedisCounter(requestId);
+    console.log(`❌ [GET /users/:id] Error | Duration: ${duration}ms | Redis: ${counter.commands} commands, ${counter.pipelines} pipelines`);
+    cleanupRedisCounter(requestId);
+    res.status(500).json({ error: "Failed to fetch user profile" });
+  }
 });
 
 // ===== GET /feed/following: Following feed with pagination =====

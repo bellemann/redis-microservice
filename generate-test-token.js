@@ -6,10 +6,12 @@
  * This script generates a JWT token for testing the Redis microservice.
  *
  * Usage:
- *   node generate-test-token.js [user_id]
+ *   node generate-test-token.js [user_id] [role]
  *
- * Example:
- *   node generate-test-token.js 123
+ * Examples:
+ *   node generate-test-token.js 123 user
+ *   node generate-test-token.js 456 admin
+ *   node generate-test-token.js 789 model
  */
 
 import dotenv from 'dotenv';
@@ -17,8 +19,9 @@ import jwt from 'jsonwebtoken';
 
 dotenv.config();
 
-// Get user_id from command line argument, default to 'test-user-123'
+// Get user_id and role from command line arguments
 const userId = process.argv[2] || 'test-user-123';
+const role = process.argv[3] || 'user';
 
 // Check if JWT_SECRET is configured
 if (!process.env.JWT_SECRET) {
@@ -29,7 +32,8 @@ if (!process.env.JWT_SECRET) {
 
 // Generate the JWT token
 const payload = {
-  user_id: userId
+  user_id: userId,
+  role: role
 };
 
 // Sign with 900 seconds (15 minutes) expiration
@@ -43,6 +47,7 @@ const decoded = jwt.decode(token);
 // Output the results
 console.log('\n=== JWT Token Generated ===\n');
 console.log('User ID:', userId);
+console.log('Role:', role);
 console.log('Expires in: 900 seconds (15 minutes)');
 console.log('\nToken:');
 console.log(token);
