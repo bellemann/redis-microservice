@@ -48,6 +48,7 @@ function cleanupRedisCounter(requestId) {
 const originalRedis = {
   zrevrange: redis.zrevrange.bind(redis),
   smembers: redis.smembers.bind(redis),
+  sismember: redis.sismember.bind(redis),
   exists: redis.exists.bind(redis),
   zunionstore: redis.zunionstore.bind(redis),
   expire: redis.expire.bind(redis),
@@ -67,6 +68,7 @@ function createTrackedRedis(requestId) {
   return {
     zrevrange: wrapRedisCommand('zrevrange', originalRedis.zrevrange, requestId),
     smembers: wrapRedisCommand('smembers', originalRedis.smembers, requestId),
+    sismember: wrapRedisCommand('sismember', originalRedis.sismember, requestId),
     exists: wrapRedisCommand('exists', originalRedis.exists, requestId),
     zunionstore: wrapRedisCommand('zunionstore', originalRedis.zunionstore, requestId),
     expire: wrapRedisCommand('expire', originalRedis.expire, requestId),
@@ -631,7 +633,7 @@ app.post("/posts", async (req, res) => {
 
   try {
     const userId = req.user.user_id;
-    const { content, media_url, hashtags } = req.body;
+    const { content, media_url } = req.body;
 
     if (!content || content.trim().length === 0) {
       return res.status(400).json({ error: "Content is required" });
@@ -657,6 +659,7 @@ app.post("/posts", async (req, res) => {
       username: userData.username || '',
       avatar: userData.avatar || '',
       display_name: userData.display_name || userData.username || '',
+      user_role: userData.role || 'user',
       content: content.trim(),
       media_url: media_url || '',
       created_at: timestamp,
@@ -664,6 +667,9 @@ app.post("/posts", async (req, res) => {
       commentsCount: 0,
       bookmarksCount: 0
     };
+
+    // Extract hashtags from content using helper function
+    const extractedHashtags = extractHashtags(content);
 
     // Use Redis transaction for atomicity
     const multi = redis.multi();
@@ -677,13 +683,11 @@ app.post("/posts", async (req, res) => {
     // Add to user's posts
     multi.zadd(`user:${userId}:posts`, timestamp, postId);
 
-    // Add to hashtag feeds if provided
-    if (hashtags && Array.isArray(hashtags)) {
-      for (const hashtagId of hashtags) {
-        multi.zadd(`hashtag:${hashtagId}:posts`, timestamp, postId);
-        // Initialize ranked feed with score 0
-        multi.zadd(`hashtag:${hashtagId}:ranked`, 0, postId);
-      }
+    // Add to hashtag feeds using extracted hashtags from content
+    for (const hashtagId of extractedHashtags) {
+      multi.zadd(`hashtag:${hashtagId}:posts`, timestamp, postId);
+      // Initialize ranked feed with score 0
+      multi.zadd(`hashtag:${hashtagId}:ranked`, 0, postId);
     }
 
     // Increment user's post count
@@ -693,6 +697,7 @@ app.post("/posts", async (req, res) => {
 
     // Invalidate relevant caches
     delete cache[`user_profile_${userId}_${userId}`];
+    invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
@@ -739,6 +744,9 @@ app.delete("/posts/:id", async (req, res) => {
     const hashtagMatches = postData.content.match(/#(\w+)/g) || [];
     const hashtags = hashtagMatches.map(tag => tag.substring(1));
 
+    // Get all users who bookmarked this post to remove from their user:*:bookmarked
+    const bookmarkedBy = await trackedRedis.smembers(`post:${postId}:bookmarks`);
+
     // Use Redis transaction for atomicity
     const multi = redis.multi();
 
@@ -752,6 +760,11 @@ app.delete("/posts/:id", async (req, res) => {
     for (const hashtagId of hashtags) {
       multi.zrem(`hashtag:${hashtagId}:posts`, postId);
       multi.zrem(`hashtag:${hashtagId}:ranked`, postId);
+    }
+
+    // Remove post from each user's bookmarked list
+    for (const bookmarkUserId of bookmarkedBy) {
+      multi.zrem(`user:${bookmarkUserId}:bookmarked`, postId);
     }
 
     // Delete interaction sets
@@ -769,6 +782,7 @@ app.delete("/posts/:id", async (req, res) => {
 
     // Invalidate post cache
     delete postCache[postId];
+    invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
@@ -812,6 +826,9 @@ app.patch("/posts/:id/ban", async (req, res) => {
 
     console.log(`[PATCH /posts/:id/ban] Admin banning post ${postId}`);
 
+    // Get all users who bookmarked this post to remove from their user:*:bookmarked
+    const bookmarkedBy = await trackedRedis.smembers(`post:${postId}:bookmarks`);
+
     // Add banned flag for audit trail
     await redis.hset(`post:${postId}`, 'banned', 'true');
     await redis.hset(`post:${postId}`, 'banned_at', Date.now().toString());
@@ -836,6 +853,11 @@ app.patch("/posts/:id/ban", async (req, res) => {
       multi.zrem(`hashtag:${hashtagId}:ranked`, postId);
     }
 
+    // Remove post from each user's bookmarked list
+    for (const bookmarkUserId of bookmarkedBy) {
+      multi.zrem(`user:${bookmarkUserId}:bookmarked`, postId);
+    }
+
     // Delete interaction sets (post remains for audit but interactions are removed)
     multi.del(`post:${postId}:likes`);
     multi.del(`post:${postId}:bookmarks`);
@@ -848,6 +870,7 @@ app.patch("/posts/:id/ban", async (req, res) => {
 
     // Invalidate post cache
     delete postCache[postId];
+    invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
@@ -884,7 +907,7 @@ app.post("/posts/:id/like", async (req, res) => {
     }
 
     // Check if already liked
-    const alreadyLiked = await redis.sismember(`post:${postId}:likes`, userId);
+    const alreadyLiked = await trackedRedis.sismember(`post:${postId}:likes`, userId);
     if (alreadyLiked) {
       return res.status(400).json({ error: "Post already liked" });
     }
@@ -934,6 +957,7 @@ app.post("/posts/:id/like", async (req, res) => {
 
     // Invalidate post cache
     delete postCache[postId];
+    invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
@@ -970,7 +994,7 @@ app.delete("/posts/:id/like", async (req, res) => {
     }
 
     // Check if liked
-    const isLiked = await redis.sismember(`post:${postId}:likes`, userId);
+    const isLiked = await trackedRedis.sismember(`post:${postId}:likes`, userId);
     if (!isLiked) {
       return res.status(400).json({ error: "Post not liked" });
     }
@@ -1018,6 +1042,7 @@ app.delete("/posts/:id/like", async (req, res) => {
 
     // Invalidate post cache
     delete postCache[postId];
+    invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
@@ -1054,7 +1079,7 @@ app.post("/posts/:id/bookmark", async (req, res) => {
     }
 
     // Check if already bookmarked
-    const alreadyBookmarked = await redis.sismember(`post:${postId}:bookmarks`, userId);
+    const alreadyBookmarked = await trackedRedis.sismember(`post:${postId}:bookmarks`, userId);
     if (alreadyBookmarked) {
       return res.status(400).json({ error: "Post already bookmarked" });
     }
@@ -1106,6 +1131,7 @@ app.post("/posts/:id/bookmark", async (req, res) => {
 
     // Invalidate post cache
     delete postCache[postId];
+    invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
@@ -1142,7 +1168,7 @@ app.delete("/posts/:id/bookmark", async (req, res) => {
     }
 
     // Check if bookmarked
-    const isBookmarked = await redis.sismember(`post:${postId}:bookmarks`, userId);
+    const isBookmarked = await trackedRedis.sismember(`post:${postId}:bookmarks`, userId);
     if (!isBookmarked) {
       return res.status(400).json({ error: "Post not bookmarked" });
     }
@@ -1193,6 +1219,7 @@ app.delete("/posts/:id/bookmark", async (req, res) => {
 
     // Invalidate post cache
     delete postCache[postId];
+    invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
@@ -1319,7 +1346,7 @@ app.post("/users/:id/follow", async (req, res) => {
     }
 
     // Check if already following
-    const alreadyFollowing = await redis.sismember(`user:${userId}:following`, targetUserId);
+    const alreadyFollowing = await trackedRedis.sismember(`user:${userId}:following`, targetUserId);
     if (alreadyFollowing) {
       return res.status(400).json({ error: "Already following this user" });
     }
@@ -1344,6 +1371,7 @@ app.post("/users/:id/follow", async (req, res) => {
     delete cache[`user_profile_${targetUserId}_${targetUserId}`];
     delete userCache[userId];
     delete userCache[targetUserId];
+    invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
@@ -1378,7 +1406,7 @@ app.delete("/users/:id/follow", async (req, res) => {
     const trackedRedis = createTrackedRedis(requestId);
 
     // Check if following
-    const isFollowing = await redis.sismember(`user:${userId}:following`, targetUserId);
+    const isFollowing = await trackedRedis.sismember(`user:${userId}:following`, targetUserId);
     if (!isFollowing) {
       return res.status(400).json({ error: "Not following this user" });
     }
@@ -1403,6 +1431,7 @@ app.delete("/users/:id/follow", async (req, res) => {
     delete cache[`user_profile_${targetUserId}_${targetUserId}`];
     delete userCache[userId];
     delete userCache[targetUserId];
+    invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
     const counter = getRedisCounter(requestId);
@@ -1509,6 +1538,7 @@ app.patch("/users/:id", async (req, res) => {
 
     // Invalidate user cache
     delete userCache[userId];
+    invalidateFeedCaches();
     for (const key in cache) {
       if (key.includes(`user_profile_${userId}`)) {
         delete cache[key];
@@ -1599,7 +1629,21 @@ app.delete("/users/:id", async (req, res) => {
 
     const cleanupMulti = redis.multi();
 
+    // Check which posts the user actually liked to decrement likesCount
+    const likeCheckPipeline = trackedRedis.pipeline();
     for (const postId of explorePosts) {
+      likeCheckPipeline.sismember(`post:${postId}:likes`, userId);
+    }
+    const likeCheckResults = await likeCheckPipeline.exec();
+
+    for (let i = 0; i < explorePosts.length; i++) {
+      const postId = explorePosts[i];
+      const [err, wasLiked] = likeCheckResults[i];
+
+      if (!err && wasLiked === 1) {
+        cleanupMulti.hincrby(`post:${postId}`, 'likesCount', -1);
+      }
+
       cleanupMulti.srem(`post:${postId}:likes`, userId);
       cleanupMulti.srem(`post:${postId}:bookmarks`, userId);
     }
@@ -1630,6 +1674,7 @@ app.delete("/users/:id", async (req, res) => {
 
     // Invalidate all caches
     delete userCache[userId];
+    invalidateFeedCaches();
     for (const key in cache) {
       if (key.includes(userId)) {
         delete cache[key];
@@ -1989,8 +2034,8 @@ app.get("/feed/following", async (req, res) => {
         // Move offset forward for next iteration
         currentOffset += explorePosts.length;
 
-        // Safety limit to prevent infinite loops
-        if (currentOffset > 10000) break;
+        // Safety limit to prevent infinite loops (reduced for performance)
+        if (currentOffset > 3000) break;
       }
 
       console.log(`Filtered to ${posts.length} posts from followed users`);
@@ -2143,7 +2188,11 @@ app.get("/search/hashtags/top-posts", async (req, res) => {
 
   try {
     const hashtagIds = req.query.hashtags ? req.query.hashtags.split(',') : [];
-    const postsPerHashtag = parseInt(req.query.postsPerHashtag) || 5;
+    let postsPerHashtag = parseInt(req.query.postsPerHashtag) || 5;
+
+    // Validate postsPerHashtag (limit to reasonable range)
+    if (postsPerHashtag > 50) postsPerHashtag = 50;
+    if (postsPerHashtag < 1) postsPerHashtag = 1;
 
     if (hashtagIds.length === 0) {
       return res.status(400).json({ error: "Provide hashtags query parameter (comma-separated)" });
