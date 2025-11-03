@@ -525,39 +525,6 @@ npm start
 
 The server will start on the port specified in your `.env` file (default: 3000).
 
-### Generating Test JWT Tokens
-
-Use the included `generate-test-token.js` script to create JWT tokens for testing:
-
-```bash
-node generate-test-token.js [user_id] [role]
-```
-
-**Parameters:**
-- `user_id` (optional, default: `test-user-123`) - User identifier
-- `role` (optional, default: `user`) - User role (`admin`, `user`, or `model`)
-
-**Examples:**
-```bash
-# Generate token for regular user
-node generate-test-token.js 123 user
-
-# Generate token for admin
-node generate-test-token.js 456 admin
-
-# Generate token for model
-node generate-test-token.js 789 model
-
-# Use defaults (test-user-123, user)
-node generate-test-token.js
-```
-
-The script will output:
-- User ID and role
-- JWT token (valid for 15 minutes)
-- Decoded payload
-- Example cURL commands for testing
-
 ## Docker
 
 Build the Docker image:
