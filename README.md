@@ -1,16 +1,20 @@
 # Redis Microservice
 
-A secure, read-only Redis proxy microservice with JWT-based authentication and user-specific access control.
+A secure Redis-backed social media API with JWT-based authentication, denormalized data structures, and comprehensive feed/interaction endpoints.
 
 ## Overview
 
-This microservice provides a REST API interface to Redis with built-in security features:
+This microservice provides a comprehensive social media backend with:
 
-- **JWT Authentication**: Secure endpoint access with JWT tokens
-- **Read-Only Proxy**: Only allows safe Redis read commands (GET, HGETALL, SMEMBERS, etc.)
-- **User-based Access Control**: Automatic key namespacing based on authenticated user_id
-- **Placeholder Replacement**: `user:AUTH` automatically resolves to `user:{user_id}`
-- **Security Checks**: Prevents unauthorized access to sensitive keys and other users' data
+- **JWT Authentication**: Secure endpoint access with JWT tokens and role-based authorization
+- **Post Management**: Create, delete, like, bookmark posts with denormalized user data
+- **User Management**: Follow/unfollow, profile updates with automatic denormalization
+- **Feed Endpoints**: Explore, following, hashtag (chronological & ranked) feeds
+- **Search Functionality**: User search by role, top posts by hashtag, top models by engagement
+- **Privacy Controls**: Automatic user data sanitization based on viewer relationship
+- **Interaction Tracking**: isLiked/isBookmarked flags on all feed responses
+- **Multi-Layer Caching**: Post, user, and feed caching for optimal performance
+- **Time-Decayed Ranking**: Engagement-based scoring with 2-week TTL for trending content
 
 ## Installation
 
@@ -42,11 +46,37 @@ PORT=3000
 
 ### Protected Routes (JWT Authentication Required)
 
+#### Post Endpoints
+- **`POST /posts`** - Create a new post with denormalized user data
+- **`DELETE /posts/:id`** - Delete a post (owner or admin)
+- **`POST /posts/:id/like`** - Like a post
+- **`DELETE /posts/:id/like`** - Unlike a post
+- **`POST /posts/:id/bookmark`** - Bookmark a post
+- **`DELETE /posts/:id/bookmark`** - Remove bookmark from a post
+- **`PATCH /posts/:id/ban`** - Ban a post (admin only)
+
+#### User Endpoints
+- **`GET /users/:id`** - Get user profile with privacy controls
+- **`PATCH /users/:id`** - Update user profile (self only)
+- **`DELETE /users/:id`** - Delete user account with cascading cleanup (self or admin)
+- **`POST /users/:id/follow`** - Follow a user
+- **`DELETE /users/:id/follow`** - Unfollow a user
+- **`GET /users/:id/bookmarked`** - Get user's bookmarked posts (self only)
+
+#### Feed Endpoints
+- **`GET /feed/following`** - Following feed (posts from followed users, paginated)
+- **`GET /feed/hashtag/:id`** - Hashtag feed (chronological order)
+- **`GET /feed/hashtag/:id/ranked`** - Hashtag feed (engagement-ranked with time decay)
+
+#### Search Endpoints
+- **`GET /search/users/newest`** - Get newest users by role (user/model)
+- **`GET /search/hashtags/top-posts`** - Get top posts from multiple hashtags
+- **`GET /search/models/top`** - Get top models by engagement score
+
+#### Utility Endpoints
 - **`POST /`** - Redis proxy endpoint for executing Redis commands
 - **`GET/POST /whoami`** - Returns the decoded JWT payload
 - **`GET/POST /debug-auth`** - Tests Redis key resolution with placeholder replacement
-- **`GET /users/:id`** - Get user profile with privacy controls
-- **`GET /feed/following`** - Following feed (posts from followed users, paginated)
 
 ## JWT Authentication
 
@@ -301,27 +331,256 @@ curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
   "http://localhost:3000/feed/following?offset=0&limit=10&includeUser=false"
 ```
 
+## API Endpoint Details
+
+### Post Management
+
+#### POST /posts
+Create a new post with denormalized user data (username, avatar, display_name).
+
+**Request Body:**
+```json
+{
+  "content": "This is my post #hashtag",
+  "media_url": "https://example.com/image.jpg",
+  "hashtags": ["hashtag", "trending"]
+}
+```
+
+**Response:** Created post object with denormalized user data.
+
+**Side Effects:**
+- Adds to `explore:feed`, `user:{user_id}:posts`, and `hashtag:{id}:posts` sorted sets
+- Increments user's `postCount`
+- Initializes `hashtag:{id}:ranked` with score 0
+
+#### DELETE /posts/:id
+Delete a post (owner or admin only).
+
+**Authorization:** Owner or admin role required.
+
+**Side Effects:**
+- Removes from all feeds
+- Deletes `post:{id}:likes`, `post:{id}:bookmarks`, `post:{id}:comments` sets
+- Decrements user's `postCount`
+
+#### POST /posts/:id/like
+Like a post.
+
+**Side Effects:**
+- Adds user to `post:{id}:likes` set
+- Increments `likesCount` on post
+- Updates `hashtag:{id}:ranked` scores with time-decayed formula
+- Increments `models:top:engagement` if post owner is a model
+
+**Ranking Formula:**
+```
+score = (likes*3 + comments*5 + bookmarks*4) / ((current_time - created_at) / 3600 + 1)
+```
+
+Posts older than 2 weeks get score = 0.
+
+#### POST /posts/:id/bookmark
+Bookmark a post.
+
+**Side Effects:**
+- Adds user to `post:{id}:bookmarks` set
+- Adds post to `user:{user_id}:bookmarked` sorted set
+- Increments `bookmarksCount` on post
+- Updates ranked feeds
+
+#### PATCH /posts/:id/ban
+Ban a post (admin only).
+
+**Authorization:** Admin role required.
+
+**Side Effects:**
+- Marks post with `banned: true`, `banned_at`, `banned_by` fields
+- Removes from all feeds
+- Deletes interaction sets
+- Post hash remains for audit trail
+
+### User Management
+
+#### PATCH /users/:id
+Update user profile (username, display_name, bio, avatar, links).
+
+**Authorization:** Self only.
+
+**Request Body:**
+```json
+{
+  "username": "newusername",
+  "display_name": "New Name",
+  "bio": "Updated bio",
+  "avatar": "https://example.com/avatar.jpg",
+  "links": "https://example.com"
+}
+```
+
+**Denormalization:** If username, display_name, or avatar changes, updates all user's posts automatically.
+
+#### POST /users/:id/follow
+Follow a user.
+
+**Side Effects:**
+- Adds to `user:{user_id}:following` set
+- Adds to `user:{target_id}:followers` set
+- Increments `followingCount` and `followerCount`
+
+#### DELETE /users/:id
+Delete user account with cascading cleanup.
+
+**Authorization:** Self or admin.
+
+**Side Effects:**
+- Deletes all user's posts
+- Removes user from all `post:{id}:likes` and `post:{id}:bookmarks` sets
+- Deletes all user keys
+- Removes from `users:models` or `users:regular` sorted sets
+
+### Feed Endpoints
+
+#### GET /feed/hashtag/:id
+Returns posts with a specific hashtag in chronological order.
+
+**Query Parameters:**
+- `offset` (default: 0)
+- `limit` (default: 20, max: 100)
+- `includeUser` (default: true)
+
+**Response:** Same format as `/feed/explore`.
+
+#### GET /feed/hashtag/:id/ranked
+Returns posts with a specific hashtag ranked by engagement score (time-decayed).
+
+**Query Parameters:** Same as chronological endpoint.
+
+**Ranking:** Posts sorted by engagement score calculated from likes, comments, bookmarks, and post age.
+
+### Search Endpoints
+
+#### GET /search/users/newest
+Get newest users by role.
+
+**Query Parameters:**
+- `role` - "user" or "model" (default: "user")
+- `limit` (default: 10, max: 100)
+
+**Response:**
+```json
+{
+  "users": [
+    {
+      "uuid": "user-id",
+      "username": "johndoe",
+      "display_name": "John Doe"
+    }
+  ],
+  "count": 10
+}
+```
+
+**Privacy:** User data is sanitized (sensitive fields removed).
+
+#### GET /search/hashtags/top-posts
+Get top posts from multiple hashtags.
+
+**Query Parameters:**
+- `hashtags` - Comma-separated hashtag IDs (max 12)
+- `postsPerHashtag` (default: 5)
+
+**Response:**
+```json
+{
+  "hashtags": {
+    "travel": [
+      { "post": {...}, "user": {...} }
+    ],
+    "food": [
+      { "post": {...}, "user": {...} }
+    ]
+  }
+}
+```
+
+#### GET /search/models/top
+Get top models by engagement score.
+
+**Query Parameters:**
+- `limit` (default: 5, max: 100)
+
+**Response:**
+```json
+{
+  "models": [
+    {
+      "uuid": "model-id",
+      "username": "topmodel",
+      "engagement_score": 1234.5
+    }
+  ],
+  "count": 5
+}
+```
+
+### Interaction Status
+
+All feed endpoints return `isLiked` and `isBookmarked` flags on each post when user is authenticated:
+
+```json
+{
+  "post": {
+    "id": "post-id",
+    "content": "Post content",
+    "isLiked": true,
+    "isBookmarked": false,
+    ...
+  }
+}
+```
+
+These flags are computed via batched `SISMEMBER` checks using Redis pipelines.
+
 ## Redis Data Structure
 
-The feed endpoints expect the following Redis key structure:
+### Core Data Keys
 
-- **`explore:feed`** - Sorted Set (Score = Timestamp, Member = Post UUID)
-  - Contains post UUIDs for the global explore feed
-  - Higher scores (timestamps) represent newer posts
+- **`post:{id}`** - Hash
+  - Post data with denormalized user fields: `id`, `user_id`, `username`, `avatar`, `display_name`, `content`, `media_url`, `created_at`, `likesCount`, `commentsCount`, `bookmarksCount`
+  - May include `banned`, `banned_at`, `banned_by` for banned posts
 
-- **`post:{uuid}`** - Hash
-  - Contains post data including `user_id`, `content`, `created_at`, etc.
+- **`user:{id}`** - Hash
+  - User profile: `username`, `display_name`, `bio`, `avatar`, `links`, `role`, `postCount`, `followerCount`, `followingCount`
+  - Sensitive fields (only visible to self): `first_name`, `last_name`, `email`, `phone`, etc.
 
-- **`user:{uuid}`** - Hash
-  - Contains user profile data including `username`, `display_name`, etc.
+### Feed Sorted Sets (Score = Timestamp)
 
-- **`user:{uuid}:following`** - Set
-  - Contains user IDs that the user follows
+- **`explore:feed`** - Global feed, all public posts
+- **`user:{id}:posts`** - All posts by a specific user
+- **`hashtag:{id}:posts`** - All posts with a specific hashtag (chronological)
+- **`user:{id}:bookmarked`** - User's bookmarked posts
 
-- **`user:{uuid}:posts`** - Sorted Set (Score = Timestamp, Member = Post UUID)
-  - Contains post UUIDs for a specific user
-  - **Required** for optimal following feed performance
-  - If absent, the service will fall back to filtering `explore:feed` by followed users (less efficient)
+### Engagement Sorted Sets (Score = Engagement Score)
+
+- **`hashtag:{id}:ranked`** - Hashtag posts ranked by time-decayed engagement
+- **`models:top:engagement`** - Top models by total engagement (likes + comments + bookmarks)
+
+### User Relationship Sets
+
+- **`user:{id}:following`** - Set of user IDs this user follows
+- **`user:{id}:followers`** - Set of user IDs following this user
+
+### Interaction Sets
+
+- **`post:{id}:likes`** - Set of user IDs who liked this post
+- **`post:{id}:bookmarks`** - Set of user IDs who bookmarked this post
+- **`post:{id}:comments`** - Set/list of comment IDs on this post
+
+### User Registry Sorted Sets (Score = Timestamp)
+
+- **`users:regular`** - All regular users (role = "user")
+- **`users:models`** - All model users (role = "model")
 
 ## Performance Notes
 
