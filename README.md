@@ -105,10 +105,10 @@ openssl rand -hex 32
 - **`GET /search/models/top`** - Get top models by engagement score
 
 #### Utility Endpoints
-- **`POST /`** - Redis proxy endpoint for executing read-only Redis commands
-- **`POST /redis/write`** - Write-enabled Redis proxy for safe user data modifications
+- **`POST /`** - Redis proxy endpoint (API key auth only, for backend services)
+- **`POST /redis/write`** - Write-enabled Redis proxy (API key auth only, for backend services)
 - **`GET/POST /whoami`** - Returns the decoded JWT payload
-- **`GET/POST /debug-auth`** - Tests Redis key resolution with placeholder replacement
+- **`GET/POST /debug-auth`** - Debug endpoint for JWT authentication testing
 
 ## JWT Authentication
 
@@ -175,21 +175,6 @@ X-API-Key: your-api-key-here
 
 For detailed setup and usage, see [Xano Sync Guide](./docs/XANO_SYNC_GUIDE.md).
 
-## Placeholder Replacement (`user:AUTH` and `user:me`)
-
-The service automatically replaces `user:AUTH` and `user:me` placeholders with `user:<username>` in Redis commands, where `<username>` is extracted from the JWT token.
-
-**Both Placeholders Supported:**
-- `user:me` - Recommended (more intuitive, follows REST conventions)
-- `user:AUTH` - Alternative (legacy support)
-
-**Examples:**
-- Request: `[["GET", "user:me:following"]]` or `[["GET", "user:AUTH:following"]]`
-- Resolves to: `["GET", "user:alice:following"]` (if username is "alice")
-
-**Note:** `user:me` is recommended for frontend developers as it's more intuitive and follows common REST API patterns (similar to `/users/me` endpoints).
-
-Both placeholders resolve to `user:<username>` from your JWT token, allowing clients to query their own data without hardcoding their username.
 
 ## User Profile Endpoint
 
@@ -668,28 +653,24 @@ These flags are computed via batched `SISMEMBER` checks using Redis pipelines.
 
 ## Security Features
 
-### 1. Read-Only Mode
-The service operates on a deny-list basis, blocking the following write commands:
-- SET, MSET, APPEND
-- DEL
-- HSET, HINCRBY
-- ZADD, ZREM
-- INCR, DECR
-- EXPIRE
+### Redis Proxy Endpoints (API Key Only)
 
-All other Redis read commands are allowed by default.
+⚠️ **Note:** Redis proxy endpoints (`POST /` and `POST /redis/write`) require API key authentication and are intended for backend services only (Xano sync). Frontend clients should use REST API endpoints.
 
-### 2. Access Control
-Users can only access keys matching these patterns:
-- `user:<your_username>:*` - User-specific keys (e.g., posts, followers, bookmarks)
-- `user:<your_username>` - Your own user profile hash
+### 1. Command Filtering
+**Read Proxy (`POST /`)**: Blocks write commands (SET, DEL, HSET, ZADD, etc.)
+**Write Proxy (`POST /redis/write`)**: Only allows HSET, HDEL, HINCRBY
+
+### 2. Key Format Validation
+Keys must match valid patterns:
+- `user:<username>:*` - User-specific keys
+- `user:<username>` - User profile hash
 - Public keys (no "user:" prefix)
 
-**Important:** Direct reads of other users' profile hashes (e.g., `HGETALL user:bob`) are blocked to protect sensitive fields. To access other users' profiles, use the `GET /users/:id` endpoint which automatically sanitizes sensitive data.
+### 3. Field Restrictions (Write Proxy)
+System-managed fields (role, postCount, followerCount, etc.) cannot be modified via proxy. Use REST endpoints instead.
 
-Attempts to access other users' keys are blocked with a 403 Forbidden error.
-
-### 3. Sensitive Key Protection
+### 4. Sensitive Key Protection
 The following key patterns are blocked:
 - `otp:*` - One-time passwords
 - `session*` - Session data
@@ -697,7 +678,9 @@ The following key patterns are blocked:
 
 ## Write-Enabled Redis Proxy
 
-The `POST /redis/write` endpoint provides authenticated users with the ability to perform safe write operations on their own user data using the AUTH placeholder. This complements the read-only Redis proxy by enabling direct Redis writes for non-critical fields.
+⚠️ **Migration Notice (November 2025):** Redis proxy endpoints (`POST /` and `POST /redis/write`) now require API key authentication only. JWT-based access has been removed. Frontend clients should use REST endpoints exclusively.
+
+The `POST /redis/write` endpoint provides API-key authenticated access for backend services (Xano sync) to perform safe write operations on user data. This is for server-to-server communication only.
 
 ### Endpoint
 
@@ -705,12 +688,16 @@ The `POST /redis/write` endpoint provides authenticated users with the ability t
 
 ### Authentication
 
-Required (JWT token)
+Required: **API Key Only** (`X-API-Key` header)
+
+- JWT tokens are no longer supported for proxy endpoints
+- API keys grant admin-level access for backend sync operations
+- See [Xano Sync Guide](./docs/XANO_SYNC_GUIDE.md) for setup
 
 ### Request Format
 
 - **Body:** Array of Redis commands
-- **Example:** `[["HSET", "user:AUTH", "bio", "My new bio"]]`
+- **Example:** `[["HSET", "user:alice", "bio", "Updated bio"]]`
 
 ### Allowed Commands
 
@@ -720,13 +707,6 @@ Only the following write commands are permitted:
 - `HDEL` - Delete hash field
 - `HINCRBY` - Increment hash field by integer
 
-### `user:AUTH` and `user:me` Placeholder
-
-- Use `user:me` (recommended) or `user:AUTH` in commands to reference your own user data
-- Automatically replaced with `user:<your_username>` from JWT token
-- **Example:** `HSET user:me bio "value"` becomes `HSET user:alice bio "value"`
-- **Note:** Both placeholders work identically, but `user:me` is more intuitive
-
 ### Security Restrictions
 
 #### 1. Command Whitelist
@@ -735,99 +715,83 @@ Only HSET, HDEL, and HINCRBY commands are allowed. All other commands are blocke
 ERR command not allowed in write mode
 ```
 
-#### 2. Key Restriction
-Users can only modify keys matching the `user:<your_username>` pattern. Attempting to modify other users' data returns:
+#### 2. Key Format Validation
+Keys must match the `user:<username>` pattern. Invalid key formats return:
 ```
-ERR forbidden: can only modify your own user data
+ERR invalid key format
 ```
 
-**Note:** API key authentication bypasses ownership checks and allows modifying any user data (used for Xano sync).
+**Note:** API key authentication allows modifying any user data (required for Xano sync operations).
 
 #### 3. Field Restrictions
-Certain fields cannot be modified directly and require using `PATCH /users/:id` instead:
-
-**Blocked Fields (require denormalization):**
-- `username` - Requires updating all user's posts
-- `display_name` - Requires updating all user's posts
-- `avatar` - Requires updating all user's posts
 
 **Blocked Fields (system-managed):**
 - `role` - User role (admin/user/model)
 - `postCount` - Automatically managed
 - `followerCount` - Automatically managed
 - `followingCount` - Automatically managed
-
-**Allowed Fields:**
-- `bio` - User biography
-- `links` - User links/URLs
-- Custom fields - Any other user-defined fields
+- `username` - Immutable identifier
+- `display_name` - Requires denormalization
+- `avatar` - Requires denormalization
 
 Attempting to modify blocked fields returns:
 ```
 ERR field '<field>' cannot be modified directly, use PATCH /users/:id
 ```
 
+**Allowed Fields:**
+- Any other user-defined fields (bio, links, custom metadata)
+
 ### Use Cases
 
-- Update bio or links without full profile update
-- Manage custom user metadata fields
-- Increment custom counters (e.g., profile views)
-- Quick field updates without denormalization overhead
-
-### When to Use PATCH /users/:id Instead
-
-Use the dedicated `PATCH /users/:id` endpoint when:
-- Updating username, display_name, or avatar (requires denormalization to posts)
-- Updating multiple fields that might affect feed display
-- You need the full profile update workflow with validation
+- Backend sync operations (Xano → Redis)
+- Batch user data updates from external systems
+- System-level data management and maintenance
 
 ### Example Requests
 
-#### Update Bio
+#### Update User Bio (API Key Auth)
 ```bash
 curl -X POST http://localhost:3000/redis/write \
-  -H "Authorization: Bearer <token>" \
+  -H "X-API-Key: your-api-key-here" \
   -H "Content-Type: application/json" \
-  -d '[["HSET", "user:AUTH", "bio", "My new bio"]]'
+  -d '[["HSET", "user:alice", "bio", "Updated bio"]]'
 ```
 
 **Response:**
 ```json
 {
-  "results": [1],
-  "user_id": "abc-123"
+  "results": [1]
 }
 ```
 
-#### Update Multiple Fields
+#### Update Multiple User Fields
 ```bash
 curl -X POST http://localhost:3000/redis/write \
-  -H "Authorization: Bearer <token>" \
+  -H "X-API-Key: your-api-key-here" \
   -H "Content-Type: application/json" \
-  -d '[["HSET", "user:AUTH", "bio", "New bio"], ["HSET", "user:AUTH", "links", "https://example.com"]]'
+  -d '[["HSET", "user:bob", "bio", "New bio"], ["HSET", "user:bob", "links", "https://example.com"]]'
 ```
 
 **Response:**
 ```json
 {
-  "results": [1, 1],
-  "user_id": "abc-123"
+  "results": [1, 1]
 }
 ```
 
-#### Increment Custom Counter
+#### Increment User Counter
 ```bash
 curl -X POST http://localhost:3000/redis/write \
-  -H "Authorization: Bearer <token>" \
+  -H "X-API-Key: your-api-key-here" \
   -H "Content-Type: application/json" \
-  -d '[["HINCRBY", "user:AUTH", "custom_counter", "1"]]'
+  -d '[["HINCRBY", "user:charlie", "profile_views", "1"]]'
 ```
 
 **Response:**
 ```json
 {
-  "results": [5],
-  "user_id": "abc-123"
+  "results": [42]
 }
 ```
 
@@ -835,39 +799,43 @@ curl -X POST http://localhost:3000/redis/write \
 
 The response is an object containing:
 - `results` - Array of results matching input commands
-- `user_id` - The resolved user ID from the JWT token (shows which user's data was modified)
 
 **Success Example:**
 ```json
 {
-  "results": [1, 1],
-  "user_id": "abc-123"
+  "results": [1, 1]
 }
 ```
 
 **Error Example:**
 ```json
 {
-  "results": ["ERR command not allowed in write mode"],
-  "user_id": "abc-123"
+  "results": ["ERR command not allowed in write mode"]
 }
 ```
 
 ### Error Messages
 
 - `"ERR command not allowed in write mode"` - Command not in whitelist
-- `"ERR forbidden: can only modify your own user data"` - Attempting to modify other user's data
 - `"ERR field '<field>' cannot be modified directly, use PATCH /users/:id"` - Blocked field
-- `"ERR invalid key format"` - Key doesn't match user:<id> pattern
+- `"ERR invalid key format"` - Key doesn't match user:<username> pattern
 
 ### Cache Invalidation
 
 Successful writes automatically invalidate:
-- User data cache (`userCache[user_id]`)
-- User profile cache for all viewers (`user_profile_<user_id>_*`)
+- User data cache
+- User profile cache
 - Feed caches (conservative approach)
 
 This ensures data consistency across the application after write operations.
+
+### Frontend Clients
+
+⚠️ **Important:** Frontend applications should NOT use Redis proxy endpoints. Use the dedicated REST API endpoints instead:
+- `PATCH /users/:id` - Update user profiles
+- `POST /posts` - Create posts
+- `POST /posts/:id/like` - Like posts
+- See full API documentation above for all available endpoints
 
 ## Usage Examples
 
@@ -917,28 +885,28 @@ Response:
 }
 ```
 
-### 4. Execute Redis Command
+### 4. Execute Redis Command (API Key Only)
 ```bash
 curl -X POST \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "X-API-Key: your-api-key-here" \
   -H "Content-Type: application/json" \
-  -d '[["GET", "user:me:following"]]' \
+  -d '[["GET", "user:alice:following"]]' \
   http://localhost:3000/
 ```
 
 Response:
 ```json
 [
-  "user:456,user:789"
+  "user:bob,user:charlie"
 ]
 ```
 
-### 5. Get Hash Data
+### 5. Get User Data (API Key Only)
 ```bash
 curl -X POST \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "X-API-Key: your-api-key-here" \
   -H "Content-Type: application/json" \
-  -d '[["HGETALL", "user:me"]]' \
+  -d '[["HGETALL", "user:alice"]]' \
   http://localhost:3000/
 ```
 
@@ -948,29 +916,13 @@ Response:
   {
     "username": "alice",
     "display_name": "Alice Smith",
-    "email": "alice@example.com",
+    "bio": "Hello world",
     "created_at": "2024-01-01"
   }
 ]
 ```
 
-### 6. Get Set Members
-```bash
-curl -X POST \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '[["SMEMBERS", "user:me:followers"]]' \
-  http://localhost:3000/
-```
-
-### 7. Query Public Data (No user: prefix)
-```bash
-curl -X POST \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '[["ZRANGE", "leaderboard", "0", "10"]]' \
-  http://localhost:3000/
-```
+**Note:** Frontend clients should use `GET /users/:id` REST endpoint instead.
 
 ## Error Responses
 
@@ -1004,10 +956,10 @@ Note: Tokens expire after 15 minutes (900 seconds).
 ```
 Note: JWT tokens must include a valid `role` field (admin, user, or model).
 
-### 403 Forbidden (Access to Other User's Data)
+### 403 Forbidden (Insufficient Permissions)
 ```json
 {
-  "error": "Forbidden: You can only access your own user:ID:* keys"
+  "error": "Forbidden: Insufficient permissions"
 }
 ```
 
@@ -1076,14 +1028,13 @@ Every request is assigned a unique request ID and tracks:
 ❌ [GET /users/:id] User not found | Duration: 8ms | Redis: 1 commands, 0 pipelines
 ```
 
-**Redis Proxy Requests:**
+**Redis Proxy Requests (API Key):**
 ```
-=== Redis Request ===
-JWT user_id: 123
-Command: GET
-Original args: ["user:AUTH:following"]
-Resolved args: ["user:123:following"]
-Redis result: ["456", "789"]
+=== Redis Request (API Key) ===
+Username: xano_sync
+Command: HGETALL
+Original args: ["user:alice"]
+Redis result: {"username": "alice", "display_name": "Alice Smith", "bio": "Hello world"}
 =====================
 ```
 
