@@ -625,6 +625,148 @@ app.post("/", async (req, res) => {
   res.json(results);
 });
 
+// ===== POST /redis/write: Write-enabled Redis proxy with AUTH placeholder =====
+app.post("/redis/write", async (req, res) => {
+  const requestId = getRequestId();
+  initRedisCounter(requestId);
+  const startTime = Date.now();
+
+  try {
+    const tokenUserId = req.user.user_id;
+    const commands = req.body;
+
+    if (!Array.isArray(commands) || commands.length === 0) {
+      return res.status(400).json({ error: "Request body must be a non-empty array of commands" });
+    }
+
+    // Whitelist of allowed write commands
+    const allowedWriteCommands = ["HSET", "HDEL", "HINCRBY"];
+
+    // Fields that cannot be modified directly (require PATCH /users/:id for denormalization)
+    const blockedFields = [
+      "username", "display_name", "avatar",  // Require denormalization to posts
+      "role", "postCount", "followerCount", "followingCount"  // System-managed
+    ];
+
+    const results = [];
+
+    for (let command of commands) {
+      if (!Array.isArray(command) || command.length === 0) {
+        results.push("ERR invalid command format");
+        continue;
+      }
+
+      const [cmdRaw, ...args] = command;
+      const cmd = cmdRaw.toUpperCase();
+
+      // Check command whitelist
+      if (!allowedWriteCommands.includes(cmd)) {
+        results.push("ERR command not allowed in write mode");
+        continue;
+      }
+
+      try {
+        // Replace user:AUTH placeholders
+        const argsProcessed = args.map((a) =>
+          typeof a === "string" ? a.replace("user:AUTH", `user:${tokenUserId}`) : a
+        );
+
+        // Authorization check: validate key ownership
+        if (argsProcessed.length > 0 && typeof argsProcessed[0] === "string") {
+          const key = argsProcessed[0];
+
+          // Check if key matches user:<id> or user:<id>:* pattern
+          const userKeyMatch = key.match(/^user:([\w-]+)(?::.*)?$/);
+
+          if (!userKeyMatch) {
+            results.push("ERR invalid key format");
+            continue;
+          }
+
+          const keyUserId = userKeyMatch[1];
+
+          // Ensure user can only modify their own data
+          if (keyUserId !== tokenUserId) {
+            results.push("ERR forbidden: can only modify your own user data");
+            continue;
+          }
+        }
+
+        // Field restriction check for HSET and HDEL commands
+        if (cmd === "HSET" && argsProcessed.length >= 2) {
+          const fieldName = argsProcessed[1];
+          if (blockedFields.includes(fieldName)) {
+            results.push(`ERR field '${fieldName}' cannot be modified directly, use PATCH /users/:id`);
+            continue;
+          }
+        }
+
+        if (cmd === "HDEL") {
+          // HDEL can have multiple fields: HDEL key field1 field2 ...
+          const fieldsToDelete = argsProcessed.slice(1);
+          const blockedFieldAttempt = fieldsToDelete.find(f => blockedFields.includes(f));
+          if (blockedFieldAttempt) {
+            results.push(`ERR field '${blockedFieldAttempt}' cannot be modified directly, use PATCH /users/:id`);
+            continue;
+          }
+        }
+
+        if (cmd === "HINCRBY" && argsProcessed.length >= 2) {
+          const fieldName = argsProcessed[1];
+          if (blockedFields.includes(fieldName)) {
+            results.push(`ERR field '${fieldName}' cannot be modified directly, use PATCH /users/:id`);
+            continue;
+          }
+        }
+
+        // Console logging for debug
+        console.log("=== Redis Write Request ===");
+        console.log("JWT user_id:", req.user.user_id);
+        console.log("Command:", cmdRaw);
+        console.log("Original args:", args);
+        console.log("Resolved args:", argsProcessed);
+
+        // Execute Redis command
+        const trackedRedis = createTrackedRedis(requestId);
+        const result = await trackedRedis[cmd.toLowerCase()](...argsProcessed);
+
+        console.log("Redis result:", result);
+        console.log("===========================");
+
+        // Cache invalidation after successful write
+        delete userCache[tokenUserId];
+
+        // Invalidate user profile cache for all viewers
+        const profileCacheKeys = Object.keys(cache).filter(key =>
+          key.startsWith(`user_profile_${tokenUserId}_`)
+        );
+        profileCacheKeys.forEach(key => delete cache[key]);
+
+        // Invalidate feed caches (conservative approach)
+        invalidateFeedCaches();
+
+        results.push(result);
+      } catch (err) {
+        console.error("Redis write error:", err);
+        results.push(`ERR ${err.message}`);
+      }
+    }
+
+    const elapsed = Date.now() - startTime;
+    logRequest("POST", "/redis/write", 200, elapsed, requestId);
+
+    res.json({
+      results: results,
+      user_id: tokenUserId
+    });
+  } catch (err) {
+    const elapsed = Date.now() - startTime;
+    console.error("Redis write endpoint error:", err);
+    logRequest("POST", "/redis/write", 500, elapsed, requestId);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // ===== POST /posts: Create a new post =====
 app.post("/posts", async (req, res) => {
   const requestId = getRequestId();

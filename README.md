@@ -74,7 +74,8 @@ PORT=3000
 - **`GET /search/models/top`** - Get top models by engagement score
 
 #### Utility Endpoints
-- **`POST /`** - Redis proxy endpoint for executing Redis commands
+- **`POST /`** - Redis proxy endpoint for executing read-only Redis commands
+- **`POST /redis/write`** - Write-enabled Redis proxy for safe user data modifications
 - **`GET/POST /whoami`** - Returns the decoded JWT payload
 - **`GET/POST /debug-auth`** - Tests Redis key resolution with placeholder replacement
 
@@ -620,6 +621,177 @@ The following key patterns are blocked:
 - `otp:*` - One-time passwords
 - `session*` - Session data
 - Any key containing "password", "secret", "token", or "key"
+
+## Write-Enabled Redis Proxy
+
+The `POST /redis/write` endpoint provides authenticated users with the ability to perform safe write operations on their own user data using the AUTH placeholder. This complements the read-only Redis proxy by enabling direct Redis writes for non-critical fields.
+
+### Endpoint
+
+**POST /redis/write**
+
+### Authentication
+
+Required (JWT token)
+
+### Request Format
+
+- **Body:** Array of Redis commands
+- **Example:** `[["HSET", "user:AUTH", "bio", "My new bio"]]`
+
+### Allowed Commands
+
+Only the following write commands are permitted:
+
+- `HSET` - Set hash field value
+- `HDEL` - Delete hash field
+- `HINCRBY` - Increment hash field by integer
+
+### AUTH Placeholder
+
+- Use `user:AUTH` in commands to reference your own user data
+- Automatically replaced with `user:<your_user_id>` from JWT token
+- **Example:** `HSET user:AUTH bio "value"` becomes `HSET user:abc-123 bio "value"`
+
+### Security Restrictions
+
+#### 1. Command Whitelist
+Only HSET, HDEL, and HINCRBY commands are allowed. All other commands are blocked with:
+```
+ERR command not allowed in write mode
+```
+
+#### 2. Key Restriction
+Users can only modify keys matching the `user:<your_user_id>` pattern. Attempting to modify other users' data returns:
+```
+ERR forbidden: can only modify your own user data
+```
+
+#### 3. Field Restrictions
+Certain fields cannot be modified directly and require using `PATCH /users/:id` instead:
+
+**Blocked Fields (require denormalization):**
+- `username` - Requires updating all user's posts
+- `display_name` - Requires updating all user's posts
+- `avatar` - Requires updating all user's posts
+
+**Blocked Fields (system-managed):**
+- `role` - User role (admin/user/model)
+- `postCount` - Automatically managed
+- `followerCount` - Automatically managed
+- `followingCount` - Automatically managed
+
+**Allowed Fields:**
+- `bio` - User biography
+- `links` - User links/URLs
+- Custom fields - Any other user-defined fields
+
+Attempting to modify blocked fields returns:
+```
+ERR field '<field>' cannot be modified directly, use PATCH /users/:id
+```
+
+### Use Cases
+
+- Update bio or links without full profile update
+- Manage custom user metadata fields
+- Increment custom counters (e.g., profile views)
+- Quick field updates without denormalization overhead
+
+### When to Use PATCH /users/:id Instead
+
+Use the dedicated `PATCH /users/:id` endpoint when:
+- Updating username, display_name, or avatar (requires denormalization to posts)
+- Updating multiple fields that might affect feed display
+- You need the full profile update workflow with validation
+
+### Example Requests
+
+#### Update Bio
+```bash
+curl -X POST http://localhost:3000/redis/write \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '[["HSET", "user:AUTH", "bio", "My new bio"]]'
+```
+
+**Response:**
+```json
+{
+  "results": [1],
+  "user_id": "abc-123"
+}
+```
+
+#### Update Multiple Fields
+```bash
+curl -X POST http://localhost:3000/redis/write \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '[["HSET", "user:AUTH", "bio", "New bio"], ["HSET", "user:AUTH", "links", "https://example.com"]]'
+```
+
+**Response:**
+```json
+{
+  "results": [1, 1],
+  "user_id": "abc-123"
+}
+```
+
+#### Increment Custom Counter
+```bash
+curl -X POST http://localhost:3000/redis/write \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '[["HINCRBY", "user:AUTH", "custom_counter", "1"]]'
+```
+
+**Response:**
+```json
+{
+  "results": [5],
+  "user_id": "abc-123"
+}
+```
+
+### Response Format
+
+The response is an object containing:
+- `results` - Array of results matching input commands
+- `user_id` - The resolved user ID from the JWT token (shows which user's data was modified)
+
+**Success Example:**
+```json
+{
+  "results": [1, 1],
+  "user_id": "abc-123"
+}
+```
+
+**Error Example:**
+```json
+{
+  "results": ["ERR command not allowed in write mode"],
+  "user_id": "abc-123"
+}
+```
+
+### Error Messages
+
+- `"ERR command not allowed in write mode"` - Command not in whitelist
+- `"ERR forbidden: can only modify your own user data"` - Attempting to modify other user's data
+- `"ERR field '<field>' cannot be modified directly, use PATCH /users/:id"` - Blocked field
+- `"ERR invalid key format"` - Key doesn't match user:<id> pattern
+
+### Cache Invalidation
+
+Successful writes automatically invalidate:
+- User data cache (`userCache[user_id]`)
+- User profile cache for all viewers (`user_profile_<user_id>_*`)
+- Feed caches (conservative approach)
+
+This ensures data consistency across the application after write operations.
 
 ## Usage Examples
 

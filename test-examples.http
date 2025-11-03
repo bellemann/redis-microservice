@@ -176,6 +176,163 @@ Content-Type: application/json
 [["GET", "session:abc123"]]
 
 ###############################################################################
+# REDIS WRITE PROXY ENDPOINT
+###############################################################################
+# This endpoint allows authenticated users to perform safe write operations
+# on their own user data using the AUTH placeholder.
+#
+# Allowed commands: HSET, HDEL, HINCRBY
+# Allowed keys: user:AUTH (automatically replaced with user:<your_user_id>)
+#
+# Blocked fields (require PATCH /users/:id for denormalization):
+#   - username, display_name, avatar
+#   - role, postCount, followerCount, followingCount (system-managed)
+#
+# Allowed fields: bio, links, and any custom fields
+###############################################################################
+
+### SUCCESS: HSET - Update bio field
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:AUTH", "bio", "My new bio updated via Redis write proxy"]]
+
+### SUCCESS: HSET - Update links field
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:AUTH", "links", "https://example.com"]]
+
+### SUCCESS: HSET - Add custom field
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:AUTH", "custom_field", "custom_value"]]
+
+### SUCCESS: HINCRBY - Increment custom counter
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HINCRBY", "user:AUTH", "custom_counter", "1"]]
+
+### SUCCESS: HDEL - Delete custom field
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HDEL", "user:AUTH", "custom_field"]]
+
+### SUCCESS: Multiple commands in one request
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:AUTH", "bio", "New bio"], ["HSET", "user:AUTH", "links", "https://example.com"]]
+
+### ERROR: Blocked command (ZADD)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["ZADD", "user:AUTH:posts", "123", "post-id"]]
+
+### ERROR: Blocked command (DEL)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["DEL", "user:AUTH"]]
+
+### ERROR: Blocked command (SET)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["SET", "user:AUTH:token", "secret"]]
+
+### ERROR: Blocked field (username)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:AUTH", "username", "newusername"]]
+
+### ERROR: Blocked field (display_name)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:AUTH", "display_name", "New Name"]]
+
+### ERROR: Blocked field (avatar)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:AUTH", "avatar", "https://new-avatar.com/image.jpg"]]
+
+### ERROR: Blocked field (role)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:AUTH", "role", "admin"]]
+
+### ERROR: Blocked field (postCount)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:AUTH", "postCount", "9999"]]
+
+### ERROR: HDEL blocked field (username)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HDEL", "user:AUTH", "username"]]
+
+### ERROR: HINCRBY blocked field (postCount)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HINCRBY", "user:AUTH", "postCount", "1"]]
+
+### ERROR: HINCRBY blocked field (role)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HINCRBY", "user:AUTH", "role", "1"]]
+
+### ERROR: HINCRBY blocked field (followerCount)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HINCRBY", "user:AUTH", "followerCount", "10"]]
+
+### ERROR: Accessing other user's data (explicit user ID)
+# Note: Replace 'other-user-id-123' with an actual different user ID
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:other-user-id-123", "bio", "Hacked"]]
+
+### ERROR: Invalid key format (non-user key)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "somekey", "field", "value"]]
+
+###############################################################################
 # ALTERNATIVE AUTHENTICATION HEADERS
 ###############################################################################
 
