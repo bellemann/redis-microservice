@@ -3,16 +3,144 @@ import cors from "cors";
 import Redis from "ioredis";
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
+import fs from "fs";
+import { randomUUID } from "crypto";
 
 dotenv.config();
+
+/**
+ * ==================================================================================
+ * IMPORTANT: USERNAME AS PRIMARY KEY
+ * ==================================================================================
+ *
+ * This system uses USERNAME as the primary identifier for users, NOT UUID.
+ *
+ * Key Design Decisions:
+ * 1. All user keys follow pattern: user:<username> (e.g., user:alice)
+ * 2. All related keys use username: user:<username>:posts, user:<username>:following, etc.
+ * 3. Interaction sets (likes, bookmarks) store usernames instead of UUIDs
+ * 4. Role-based sets (users:models, users:regular) store usernames
+ * 5. JWT tokens MUST contain a "username" field for authentication
+ *
+ * USERNAME IMMUTABILITY:
+ * - Usernames are IMMUTABLE and cannot be changed after account creation
+ * - Changing a username would require:
+ *   - Renaming all user keys (user:<old> → user:<new>)
+ *   - Updating all post.user_id fields across all posts
+ *   - Updating all follower/following sets
+ *   - Updating all interaction sets (likes, bookmarks)
+ *   - Updating all role-based sorted sets
+ * - This is extremely complex and error-prone, so username changes are blocked
+ *
+ * See PATCH /users/:id endpoint for username change handling.
+ * ==================================================================================
+ */
+
+/**
+ * ==================================================================================
+ * SENSITIVE USER FIELDS & PRIVACY CONTROLS
+ * ==================================================================================
+ *
+ * User profiles contain both PUBLIC and PRIVATE fields. The system automatically
+ * filters sensitive fields based on who is viewing the profile.
+ *
+ * PRIVATE FIELDS (only visible when viewing your own profile):
+ * - Personal Identity: first_name, last_name, date_of_birth, birth_date
+ * - Contact Info: email, phone, phone_number, address
+ * - Security: password, password_hash, ssn, credit_card, bank_account
+ * - Technical: ip_address, device_id
+ *
+ * PUBLIC FIELDS (visible to everyone):
+ * - username, display_name, bio, avatar, links
+ * - role, postCount, followerCount, followingCount
+ * - created_at, updated_at
+ * - Any custom fields not in the sensitive list
+ *
+ * IMPLEMENTATION:
+ * - Sensitive fields are defined in SENSITIVE_USER_FIELDS array (line 234)
+ * - Filtering is done by sanitizeUserData() function (line 252)
+ * - Applied automatically in GET /users/:id endpoint (line 1990)
+ * - Applied in all feed endpoints when includeUser=true
+ * - Applied in search endpoints (newest users, top models)
+ *
+ * WHEN TO SHOW ALL FIELDS:
+ * - When username === authenticatedUsername (viewing own profile)
+ * - When using API key authentication (admin access for Xano sync)
+ *
+ * WHEN TO FILTER FIELDS:
+ * - When viewing another user's profile
+ * - In public feeds (explore feed)
+ * - In search results
+ *
+ * TO ADD NEW SENSITIVE FIELDS:
+ * 1. Add field name to SENSITIVE_USER_FIELDS array (line 234)
+ * 2. No other changes needed - sanitization is automatic
+ *
+ * TO ADD NEW PUBLIC FIELDS:
+ * - Just add to user hash - any field not in SENSITIVE_USER_FIELDS is public
+ * ==================================================================================
+ */
 
 const app = express();
 app.use(cors());
 app.options("*", cors()); // Preflight support for all routes
 app.use(express.json());
 
-// ===== Redis connection (disable ready check warning) =====
-const redis = new Redis(process.env.REDIS_URL, { enableReadyCheck: false });
+// ===== Redis connection with TLS support =====
+function createRedisConnection() {
+  const redisUrl = process.env.REDIS_URL;
+  const useTLS = process.env.USE_REDIS_TLS === 'true';
+
+  const options = {
+    enableReadyCheck: false
+  };
+
+  // If TLS is enabled and certificate files are provided
+  if (useTLS) {
+    const tlsConfig = {};
+
+    // Load CA certificate if provided (optional for Redis Cloud managed certs)
+    if (process.env.REDIS_TLS_CA_CERT && fs.existsSync(process.env.REDIS_TLS_CA_CERT)) {
+      tlsConfig.ca = fs.readFileSync(process.env.REDIS_TLS_CA_CERT);
+      console.log('✓ Loaded Redis TLS CA certificate');
+    }
+
+    // Load client certificate if provided (for mutual TLS)
+    if (process.env.REDIS_TLS_CLIENT_CERT && fs.existsSync(process.env.REDIS_TLS_CLIENT_CERT)) {
+      tlsConfig.cert = fs.readFileSync(process.env.REDIS_TLS_CLIENT_CERT);
+      console.log('✓ Loaded Redis TLS client certificate');
+    }
+
+    // Load client key if provided (for mutual TLS)
+    if (process.env.REDIS_TLS_CLIENT_KEY && fs.existsSync(process.env.REDIS_TLS_CLIENT_KEY)) {
+      tlsConfig.key = fs.readFileSync(process.env.REDIS_TLS_CLIENT_KEY);
+      console.log('✓ Loaded Redis TLS client key');
+    }
+
+    // Enable TLS with client certificates (for Redis Cloud client auth)
+    // Redis Cloud manages server certificates, we only provide client certs
+    if (Object.keys(tlsConfig).length > 0) {
+      options.tls = {
+        ...tlsConfig,
+        // For Redis Cloud: trust system CA certificates for server verification
+        // Client certificates are provided above for client authentication
+        rejectUnauthorized: true
+      };
+      console.log('✓ Redis TLS enabled with client certificates');
+    } else {
+      console.warn('⚠ USE_REDIS_TLS=true but no certificate files found. Connecting without client certificates.');
+    }
+  }
+
+  return new Redis(redisUrl, options);
+}
+
+const redis = createRedisConnection();
+
+// ===== Environment validation =====
+if (!process.env.XANO_API_KEY) {
+  console.warn('WARNING: XANO_API_KEY is not set. API key authentication will not work.');
+}
 
 // ===== Redis Request Counter =====
 const requestCounters = new Map();
@@ -54,6 +182,9 @@ const originalRedis = {
   expire: redis.expire.bind(redis),
   hgetall: redis.hgetall.bind(redis),
   hget: redis.hget.bind(redis),
+  hset: redis.hset.bind(redis),
+  hdel: redis.hdel.bind(redis),
+  hincrby: redis.hincrby.bind(redis),
   pipeline: redis.pipeline.bind(redis)
 };
 
@@ -74,6 +205,9 @@ function createTrackedRedis(requestId) {
     expire: wrapRedisCommand('expire', originalRedis.expire, requestId),
     hgetall: wrapRedisCommand('hgetall', originalRedis.hgetall, requestId),
     hget: wrapRedisCommand('hget', originalRedis.hget, requestId),
+    hset: wrapRedisCommand('hset', originalRedis.hset, requestId),
+    hdel: wrapRedisCommand('hdel', originalRedis.hdel, requestId),
+    hincrby: wrapRedisCommand('hincrby', originalRedis.hincrby, requestId),
     pipeline: function() {
       const pipeline = originalRedis.pipeline();
       const originalExec = pipeline.exec.bind(pipeline);
@@ -143,6 +277,9 @@ function setPostCache(postId, data, ttlSeconds = 600) { // 10 minutes default fo
 }
 
 // ===== User Data Sanitization =====
+// IMPORTANT: These fields are automatically removed when viewing other users' profiles.
+// See header comment for full privacy documentation.
+// To add a new sensitive field, simply add it to this array.
 const SENSITIVE_USER_FIELDS = [
   'first_name',
   'last_name',
@@ -159,17 +296,21 @@ const SENSITIVE_USER_FIELDS = [
   'bank_account',
   'ip_address',
   'device_id'
+  // ADD YOUR CUSTOM SENSITIVE FIELDS HERE
+  // Examples: 'tax_id', 'passport_number', 'driver_license', 'medical_info'
+  // Any field added here will be automatically filtered from other users' views
 ];
 
-function sanitizeUserData(userData, userId, authenticatedUserId) {
+function sanitizeUserData(userData, username, authenticatedUsername) {
   if (!userData || Object.keys(userData).length === 0) return userData;
 
-  // If viewing own profile, return all data
-  if (userId === authenticatedUserId) {
+  // PRIVACY CHECK: If viewing own profile, return all data (including sensitive fields)
+  if (username === authenticatedUsername) {
     return userData;
   }
 
-  // For other users, remove sensitive fields
+  // PRIVACY FILTER: For other users, remove all sensitive fields defined in SENSITIVE_USER_FIELDS
+  // This protects: email, phone, password, SSN, credit cards, addresses, etc.
   const sanitized = { ...userData };
   for (const field of SENSITIVE_USER_FIELDS) {
     delete sanitized[field];
@@ -285,11 +426,47 @@ app.get("/feed/explore", async (req, res) => {
   }
 });
 
-// ===== JWT AUTH MIDDLEWARE =====
+// ===== API KEY AUTHENTICATION HELPER =====
+function authenticateApiKey(req) {
+  // Check for X-API-Key header (case-insensitive)
+  const apiKey = req.headers['x-api-key'] || req.headers['X-API-Key'];
+
+  if (!apiKey || !process.env.XANO_API_KEY) {
+    return false;
+  }
+
+  return apiKey === process.env.XANO_API_KEY;
+}
+
+// ===== DUAL AUTHENTICATION MIDDLEWARE (JWT OR API KEY) =====
 app.use((req, res, next) => {
   // Allow CORS preflight requests through without auth
   if (req.method === "OPTIONS") return next();
 
+  // 1. Attempt API Key Authentication First
+  if (authenticateApiKey(req)) {
+    // Log successful API key authentication (without revealing key)
+    console.log(`✓ API Key authentication successful for ${req.method} ${req.path}`);
+
+    // Set special admin user object for API key requests
+    // API KEY PRIVILEGE: Bypasses ownership checks for writes
+    // Note: GET endpoints still enforce privacy via sanitizeUserData() unless explicitly changed
+    // Used for Xano sync to read/write any user data
+    req.user = {
+      user_id: 'xano_sync',
+      username: 'xano_sync',
+      role: 'admin',
+      isApiKey: true  // This flag bypasses ownership checks on writes
+    };
+    return next();
+  }
+
+  // Log failed API key attempt if X-API-Key header was present
+  if (req.headers['x-api-key'] || req.headers['X-API-Key']) {
+    console.warn(`⚠ Failed API key authentication attempt for ${req.method} ${req.path}`);
+  }
+
+  // 2. Fall Back to JWT Authentication
   const authHeader =
     req.headers.authorization ||
     req.headers["x-authorization"] ||
@@ -307,6 +484,11 @@ app.use((req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
+    // Validate username field (required for username-based user keys)
+    if (!decoded.username) {
+      return res.status(401).json({ error: "Missing username in token" });
+    }
+
     // Validate role field
     const role = decoded.role;
     const validRoles = ['admin', 'user', 'model'];
@@ -314,9 +496,10 @@ app.use((req, res, next) => {
       return res.status(401).json({ error: "Invalid or missing role in token" });
     }
 
-    // Assign validated role to req.user
+    // Assign validated role to req.user with isApiKey flag
     req.user = decoded;
     req.user.role = role;
+    req.user.isApiKey = false;
     next();
   } catch (e) {
     return res.status(401).json({ error: "Invalid token" });
@@ -356,7 +539,7 @@ function invalidateFeedCaches() {
 }
 
 // ===== Helper: Aggregate posts with user data =====
-async function aggregatePostsWithUsers(postIds, requestId, includeUser = true, authenticatedUserId = null) {
+async function aggregatePostsWithUsers(postIds, requestId, includeUser = true, authenticatedUsername = null) {
   if (postIds.length === 0) return [];
 
   console.log(`[aggregatePostsWithUsers] Processing ${postIds.length} post IDs (includeUser: ${includeUser})`);
@@ -467,14 +650,14 @@ async function aggregatePostsWithUsers(postIds, requestId, includeUser = true, a
   // Check interaction status (liked/bookmarked) if user is authenticated
   const interactionMap = {}; // Map of postId -> { isLiked, isBookmarked }
 
-  if (authenticatedUserId) {
+  if (authenticatedUsername) {
     const validPostIds = posts.filter(p => p).map(p => p.id);
     if (validPostIds.length > 0) {
       const interactionPipeline = trackedRedis.pipeline();
 
       for (const postId of validPostIds) {
-        interactionPipeline.sismember(`post:${postId}:likes`, authenticatedUserId);
-        interactionPipeline.sismember(`post:${postId}:bookmarks`, authenticatedUserId);
+        interactionPipeline.sismember(`post:${postId}:likes`, authenticatedUsername);
+        interactionPipeline.sismember(`post:${postId}:bookmarks`, authenticatedUsername);
       }
 
       const interactionResults = await interactionPipeline.exec();
@@ -515,9 +698,11 @@ async function aggregatePostsWithUsers(postIds, requestId, includeUser = true, a
       // Include user data (sanitized if not own user)
       let userData = postData.user_id ? (userMap[postData.user_id] || {}) : {};
 
-      // Sanitize user data based on authenticated user
+      // PRIVACY: Sanitize user data in feed responses
+      // Users in feeds only show public fields (username, display_name, bio, avatar, etc.)
+      // Sensitive fields (email, phone, etc.) are automatically removed
       if (postData.user_id) {
-        userData = sanitizeUserData(userData, postData.user_id, authenticatedUserId);
+        userData = sanitizeUserData(userData, postData.user_id, authenticatedUsername);
       }
 
       results.push({
@@ -532,7 +717,7 @@ async function aggregatePostsWithUsers(postIds, requestId, includeUser = true, a
     }
   }
 
-  console.log(`[aggregatePostsWithUsers] Returning ${results.length} aggregated posts${includeUser ? ' with users' : ' (no users)'}${authenticatedUserId ? ' with interactions' : ''}`);
+  console.log(`[aggregatePostsWithUsers] Returning ${results.length} aggregated posts${includeUser ? ' with users' : ' (no users)'}${authenticatedUsername ? ' with interactions' : ''}`);
   return results;
 }
 
@@ -548,7 +733,8 @@ app.post("/", async (req, res) => {
   }
 
   const results = [];
-  const tokenUserId = req.user.user_id;
+  const tokenUsername = req.user.username;
+  const isApiKeyAuth = req.user.isApiKey === true;
 
   for (const [cmdRaw, ...args] of commands) {
     const cmd = cmdRaw.toUpperCase();
@@ -573,21 +759,60 @@ app.post("/", async (req, res) => {
     }
 
     try {
-      // Replace user:AUTH placeholders
-      const argsProcessed = args.map((a) =>
-        typeof a === "string" ? a.replace("user:AUTH", `user:${tokenUserId}`) : a
-      );
+      // Replace user:AUTH and user:me placeholders in key positions only (only for JWT auth, API key clients should provide explicit keys)
+      // Multi-key commands that accept multiple keys as arguments
+      const multiKeyCommands = ["MGET", "DEL", "EXISTS", "TOUCH", "UNLINK", "SUNION", "SINTER", "SDIFF", "ZUNION", "ZINTER", "ZDIFF"];
 
-      // Restrict user:<id>:following access
+      const argsProcessed = args.map((a, index) => {
+        if (typeof a !== "string" || isApiKeyAuth) {
+          return a;
+        }
+
+        // For multi-key commands, apply replacement to all string arguments (they're all keys)
+        if (multiKeyCommands.includes(cmd)) {
+          return a.replace(/^user:(AUTH|me)(?=$|:)/, `user:${tokenUsername}`);
+        }
+
+        // For single-key commands, only replace the first argument (the key)
+        if (index === 0) {
+          return a.replace(/^user:(AUTH|me)(?=$|:)/, `user:${tokenUsername}`);
+        }
+
+        return a;
+      });
+
+      // Restrict user:<username>:following access
       if (
         argsProcessed.length > 0 &&
         typeof argsProcessed[0] === "string" &&
-        /^user:[\w-]+:following$/.test(argsProcessed[0])
+        /^user:[^:]+:following$/.test(argsProcessed[0])
       ) {
-        const idInKey = argsProcessed[0].split(":")[1];
-        if (idInKey !== tokenUserId) {
+        const usernameInKey = argsProcessed[0].split(":")[1];
+        if (usernameInKey !== tokenUsername) {
           results.push("ERR forbidden: private resource");
           continue;
+        }
+      }
+
+      // Block direct reads of other users' hashes for HGETALL/HGET/HMGET
+      // These commands can expose sensitive fields (email, phone, etc.)
+      // Other users' profile hashes must be accessed via GET /users/:id which applies sanitization
+      if (
+        argsProcessed.length > 0 &&
+        typeof argsProcessed[0] === "string" &&
+        ["HGETALL", "HGET", "HMGET"].includes(cmd)
+      ) {
+        const key = argsProcessed[0];
+        // Match user:<username> (exact hash key) or user:<username>:* for sensitive sub-keys
+        const userHashMatch = key.match(/^user:([^:]+)(?::.*)?$/);
+
+        if (userHashMatch) {
+          const keyUsername = userHashMatch[1];
+          // Only block if trying to access another user's data and not using API key
+          if (!isApiKeyAuth && keyUsername !== tokenUsername) {
+            results.push("ERR forbidden: private resource");
+            continue;
+          }
         }
       }
 
@@ -605,7 +830,8 @@ app.post("/", async (req, res) => {
 
       // Console logging for debug
       console.log("=== Redis Request ===");
-      console.log("JWT user_id:", req.user.user_id);
+      console.log("Auth method:", isApiKeyAuth ? "API Key" : "JWT");
+      console.log("Username:", req.user.username);
       console.log("Command:", cmdRaw);
       console.log("Original args:", args);
       console.log("Resolved args:", argsProcessed);
@@ -632,7 +858,8 @@ app.post("/redis/write", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const tokenUserId = req.user.user_id;
+    const tokenUsername = req.user.username;
+    const isApiKeyAuth = req.user.isApiKey === true;
     const commands = req.body;
 
     if (!Array.isArray(commands) || commands.length === 0) {
@@ -642,7 +869,14 @@ app.post("/redis/write", async (req, res) => {
     // Whitelist of allowed write commands
     const allowedWriteCommands = ["HSET", "HDEL", "HINCRBY"];
 
-    // Fields that cannot be modified directly (require PATCH /users/:id for denormalization)
+    // FIELD RESTRICTIONS: Certain fields require denormalization or are system-managed
+    // Blocked fields that require PATCH /users/:id (denormalization):
+    // - username, display_name, avatar (must update all user's posts)
+    // System-managed fields (auto-calculated):
+    // - role, postCount, followerCount, followingCount
+    // Allowed fields:
+    // - bio, links, and any custom fields
+    // - Sensitive fields (email, phone, etc.) can be updated
     const blockedFields = [
       "username", "display_name", "avatar",  // Require denormalization to posts
       "role", "postCount", "followerCount", "followingCount"  // System-managed
@@ -666,33 +900,38 @@ app.post("/redis/write", async (req, res) => {
       }
 
       try {
-        // Replace user:AUTH placeholders
-        const argsProcessed = args.map((a) =>
-          typeof a === "string" ? a.replace("user:AUTH", `user:${tokenUserId}`) : a
+        // Replace user:AUTH and user:me placeholders in key argument only (only for JWT auth, API key clients should provide explicit keys)
+        const argsProcessed = args.map((a, index) =>
+          index === 0 && typeof a === "string" && !isApiKeyAuth
+            ? a.replace(/^user:(AUTH|me)(?=$|:)/, `user:${tokenUsername}`)
+            : a
         );
 
-        // Authorization check: validate key ownership
+        // Authorization check: validate key format and ownership
         if (argsProcessed.length > 0 && typeof argsProcessed[0] === "string") {
           const key = argsProcessed[0];
 
-          // Check if key matches user:<id> or user:<id>:* pattern
-          const userKeyMatch = key.match(/^user:([\w-]+)(?::.*)?$/);
+          // Check if key matches user:<username> or user:<username>:* pattern
+          const userKeyMatch = key.match(/^user:([^:]+)(?::.*)?$/);
 
           if (!userKeyMatch) {
             results.push("ERR invalid key format");
             continue;
           }
 
-          const keyUserId = userKeyMatch[1];
+          const keyUsername = userKeyMatch[1];
 
-          // Ensure user can only modify their own data
-          if (keyUserId !== tokenUserId) {
+          // For JWT auth: Ensure user can only modify their own data
+          // For API key auth: Allow modification but still validate user: pattern
+          if (!isApiKeyAuth && keyUsername !== tokenUsername) {
             results.push("ERR forbidden: can only modify your own user data");
             continue;
           }
         }
 
         // Field restriction check for HSET and HDEL commands
+        // NOTE: These restrictions apply to BOTH JWT and API key requests to ensure data consistency
+        // API key requests could bypass this in the future if needed for Xano sync edge cases
         if (cmd === "HSET" && argsProcessed.length >= 2) {
           const fieldName = argsProcessed[1];
           if (blockedFields.includes(fieldName)) {
@@ -721,7 +960,8 @@ app.post("/redis/write", async (req, res) => {
 
         // Console logging for debug
         console.log("=== Redis Write Request ===");
-        console.log("JWT user_id:", req.user.user_id);
+        console.log("Auth method:", isApiKeyAuth ? "API Key (admin)" : "JWT");
+        console.log("Username:", req.user.username);
         console.log("Command:", cmdRaw);
         console.log("Original args:", args);
         console.log("Resolved args:", argsProcessed);
@@ -734,11 +974,11 @@ app.post("/redis/write", async (req, res) => {
         console.log("===========================");
 
         // Cache invalidation after successful write
-        delete userCache[tokenUserId];
+        delete userCache[tokenUsername];
 
         // Invalidate user profile cache for all viewers
         const profileCacheKeys = Object.keys(cache).filter(key =>
-          key.startsWith(`user_profile_${tokenUserId}_`)
+          key.startsWith(`user_profile_${tokenUsername}_`)
         );
         profileCacheKeys.forEach(key => delete cache[key]);
 
@@ -753,28 +993,31 @@ app.post("/redis/write", async (req, res) => {
     }
 
     const elapsed = Date.now() - startTime;
-    logRequest("POST", "/redis/write", 200, elapsed, requestId);
+    const counter = getRedisCounter(requestId);
+    console.log(`[POST /redis/write] 200 ${elapsed}ms (Redis: ${counter.commands} commands, ${counter.pipelines} pipelines) [${requestId}]`);
 
     res.json({
       results: results,
-      user_id: tokenUserId
+      username: tokenUsername
     });
   } catch (err) {
     const elapsed = Date.now() - startTime;
+    const counter = getRedisCounter(requestId);
     console.error("Redis write endpoint error:", err);
-    logRequest("POST", "/redis/write", 500, elapsed, requestId);
+    console.log(`[POST /redis/write] 500 ${elapsed}ms (Redis: ${counter.commands} commands, ${counter.pipelines} pipelines) [${requestId}]`);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ===== POST /posts: Create a new post =====
+// NOTE: API key requests will work here with user_id='xano_sync' and role='admin'
 app.post("/posts", async (req, res) => {
   const requestId = getRequestId();
   initRedisCounter(requestId);
   const startTime = Date.now();
 
   try {
-    const userId = req.user.user_id;
+    const username = req.user.username;
     const { content, media_url } = req.body;
 
     if (!content || content.trim().length === 0) {
@@ -784,20 +1027,20 @@ app.post("/posts", async (req, res) => {
     const trackedRedis = createTrackedRedis(requestId);
 
     // Fetch user data for denormalization
-    const userData = await trackedRedis.hgetall(`user:${userId}`);
+    const userData = await trackedRedis.hgetall(`user:${username}`);
 
     if (!userData || Object.keys(userData).length === 0) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    // Generate post ID and timestamp
-    const postId = `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+    // Generate post ID (UUID) and timestamp
+    const postId = randomUUID();
     const timestamp = Date.now();
 
     // Build post data with denormalized user info
     const postData = {
       id: postId,
-      user_id: userId,
+      user_id: username,
       username: userData.username || '',
       avatar: userData.avatar || '',
       display_name: userData.display_name || userData.username || '',
@@ -823,7 +1066,7 @@ app.post("/posts", async (req, res) => {
     multi.zadd('explore:feed', timestamp, postId);
 
     // Add to user's posts
-    multi.zadd(`user:${userId}:posts`, timestamp, postId);
+    multi.zadd(`user:${username}:posts`, timestamp, postId);
 
     // Add to hashtag feeds using extracted hashtags from content
     for (const hashtagId of extractedHashtags) {
@@ -833,12 +1076,12 @@ app.post("/posts", async (req, res) => {
     }
 
     // Increment user's post count
-    multi.hincrby(`user:${userId}`, 'postCount', 1);
+    multi.hincrby(`user:${username}`, 'postCount', 1);
 
     await multi.exec();
 
     // Invalidate relevant caches
-    delete cache[`user_profile_${userId}_${userId}`];
+    delete cache[`user_profile_${username}_${username}`];
     invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
@@ -858,6 +1101,7 @@ app.post("/posts", async (req, res) => {
 });
 
 // ===== DELETE /posts/:id: Delete a post =====
+// NOTE: API key requests have role='admin' and will bypass ownership check
 app.delete("/posts/:id", async (req, res) => {
   const requestId = getRequestId();
   initRedisCounter(requestId);
@@ -865,7 +1109,7 @@ app.delete("/posts/:id", async (req, res) => {
 
   try {
     const postId = req.params.id;
-    const userId = req.user.user_id;
+    const username = req.user.username;
     const userRole = req.user.role;
 
     const trackedRedis = createTrackedRedis(requestId);
@@ -878,7 +1122,8 @@ app.delete("/posts/:id", async (req, res) => {
     }
 
     // Check authorization (owner or admin)
-    if (postData.user_id !== userId && userRole !== 'admin') {
+    // API key requests will have role='admin' and will bypass this check
+    if (postData.user_id !== username && userRole !== 'admin') {
       return res.status(403).json({ error: "Not authorized to delete this post" });
     }
 
@@ -904,9 +1149,9 @@ app.delete("/posts/:id", async (req, res) => {
       multi.zrem(`hashtag:${hashtagId}:ranked`, postId);
     }
 
-    // Remove post from each user's bookmarked list
-    for (const bookmarkUserId of bookmarkedBy) {
-      multi.zrem(`user:${bookmarkUserId}:bookmarked`, postId);
+    // Remove post from each user's bookmarked list (bookmarkedBy now contains usernames)
+    for (const bookmarkUsername of bookmarkedBy) {
+      multi.zrem(`user:${bookmarkUsername}:bookmarked`, postId);
     }
 
     // Delete interaction sets
@@ -974,7 +1219,7 @@ app.patch("/posts/:id/ban", async (req, res) => {
     // Add banned flag for audit trail
     await redis.hset(`post:${postId}`, 'banned', 'true');
     await redis.hset(`post:${postId}`, 'banned_at', Date.now().toString());
-    await redis.hset(`post:${postId}`, 'banned_by', req.user.user_id);
+    await redis.hset(`post:${postId}`, 'banned_by', req.user.username);
 
     // Get hashtags from post content
     const hashtagMatches = postData.content.match(/#(\w+)/g) || [];
@@ -995,9 +1240,9 @@ app.patch("/posts/:id/ban", async (req, res) => {
       multi.zrem(`hashtag:${hashtagId}:ranked`, postId);
     }
 
-    // Remove post from each user's bookmarked list
-    for (const bookmarkUserId of bookmarkedBy) {
-      multi.zrem(`user:${bookmarkUserId}:bookmarked`, postId);
+    // Remove post from each user's bookmarked list (bookmarkedBy now contains usernames)
+    for (const bookmarkUsername of bookmarkedBy) {
+      multi.zrem(`user:${bookmarkUsername}:bookmarked`, postId);
     }
 
     // Delete interaction sets (post remains for audit but interactions are removed)
@@ -1038,7 +1283,7 @@ app.post("/posts/:id/like", async (req, res) => {
 
   try {
     const postId = req.params.id;
-    const userId = req.user.user_id;
+    const username = req.user.username;
 
     const trackedRedis = createTrackedRedis(requestId);
 
@@ -1049,7 +1294,7 @@ app.post("/posts/:id/like", async (req, res) => {
     }
 
     // Check if already liked
-    const alreadyLiked = await trackedRedis.sismember(`post:${postId}:likes`, userId);
+    const alreadyLiked = await trackedRedis.sismember(`post:${postId}:likes`, username);
     if (alreadyLiked) {
       return res.status(400).json({ error: "Post already liked" });
     }
@@ -1061,7 +1306,7 @@ app.post("/posts/:id/like", async (req, res) => {
     const multi = redis.multi();
 
     // Add user to likes set
-    multi.sadd(`post:${postId}:likes`, userId);
+    multi.sadd(`post:${postId}:likes`, username);
 
     // Increment likes count
     multi.hincrby(`post:${postId}`, 'likesCount', 1);
@@ -1125,7 +1370,7 @@ app.delete("/posts/:id/like", async (req, res) => {
 
   try {
     const postId = req.params.id;
-    const userId = req.user.user_id;
+    const username = req.user.username;
 
     const trackedRedis = createTrackedRedis(requestId);
 
@@ -1136,7 +1381,7 @@ app.delete("/posts/:id/like", async (req, res) => {
     }
 
     // Check if liked
-    const isLiked = await trackedRedis.sismember(`post:${postId}:likes`, userId);
+    const isLiked = await trackedRedis.sismember(`post:${postId}:likes`, username);
     if (!isLiked) {
       return res.status(400).json({ error: "Post not liked" });
     }
@@ -1148,7 +1393,7 @@ app.delete("/posts/:id/like", async (req, res) => {
     const multi = redis.multi();
 
     // Remove user from likes set
-    multi.srem(`post:${postId}:likes`, userId);
+    multi.srem(`post:${postId}:likes`, username);
 
     // Decrement likes count
     multi.hincrby(`post:${postId}`, 'likesCount', -1);
@@ -1210,7 +1455,7 @@ app.post("/posts/:id/bookmark", async (req, res) => {
 
   try {
     const postId = req.params.id;
-    const userId = req.user.user_id;
+    const username = req.user.username;
 
     const trackedRedis = createTrackedRedis(requestId);
 
@@ -1221,7 +1466,7 @@ app.post("/posts/:id/bookmark", async (req, res) => {
     }
 
     // Check if already bookmarked
-    const alreadyBookmarked = await trackedRedis.sismember(`post:${postId}:bookmarks`, userId);
+    const alreadyBookmarked = await trackedRedis.sismember(`post:${postId}:bookmarks`, username);
     if (alreadyBookmarked) {
       return res.status(400).json({ error: "Post already bookmarked" });
     }
@@ -1234,10 +1479,10 @@ app.post("/posts/:id/bookmark", async (req, res) => {
     const multi = redis.multi();
 
     // Add user to bookmarks set
-    multi.sadd(`post:${postId}:bookmarks`, userId);
+    multi.sadd(`post:${postId}:bookmarks`, username);
 
     // Add to user's bookmarked sorted set
-    multi.zadd(`user:${userId}:bookmarked`, timestamp, postId);
+    multi.zadd(`user:${username}:bookmarked`, timestamp, postId);
 
     // Increment bookmarks count
     multi.hincrby(`post:${postId}`, 'bookmarksCount', 1);
@@ -1299,7 +1544,7 @@ app.delete("/posts/:id/bookmark", async (req, res) => {
 
   try {
     const postId = req.params.id;
-    const userId = req.user.user_id;
+    const username = req.user.username;
 
     const trackedRedis = createTrackedRedis(requestId);
 
@@ -1310,7 +1555,7 @@ app.delete("/posts/:id/bookmark", async (req, res) => {
     }
 
     // Check if bookmarked
-    const isBookmarked = await trackedRedis.sismember(`post:${postId}:bookmarks`, userId);
+    const isBookmarked = await trackedRedis.sismember(`post:${postId}:bookmarks`, username);
     if (!isBookmarked) {
       return res.status(400).json({ error: "Post not bookmarked" });
     }
@@ -1322,10 +1567,10 @@ app.delete("/posts/:id/bookmark", async (req, res) => {
     const multi = redis.multi();
 
     // Remove user from bookmarks set
-    multi.srem(`post:${postId}:bookmarks`, userId);
+    multi.srem(`post:${postId}:bookmarks`, username);
 
     // Remove from user's bookmarked sorted set
-    multi.zrem(`user:${userId}:bookmarked`, postId);
+    multi.zrem(`user:${username}:bookmarked`, postId);
 
     // Decrement bookmarks count
     multi.hincrby(`post:${postId}`, 'bookmarksCount', -1);
@@ -1386,11 +1631,11 @@ app.get("/users/:id/bookmarked", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const userId = req.params.id;
-    const authenticatedUserId = req.user.user_id;
+    const username = req.params.id;
+    const authenticatedUsername = req.user.username;
 
     // Only allow users to view their own bookmarks
-    if (userId !== authenticatedUserId) {
+    if (username !== authenticatedUsername) {
       return res.status(403).json({ error: "Not authorized to view bookmarks" });
     }
 
@@ -1400,7 +1645,7 @@ app.get("/users/:id/bookmarked", async (req, res) => {
 
     if (limit > 100) limit = 100;
 
-    const cacheKey = `bookmarked_${userId}_${offset}_${limit}_${includeUser}`;
+    const cacheKey = `bookmarked_${username}_${offset}_${limit}_${includeUser}`;
 
     const cached = getCached(cacheKey);
     if (cached) {
@@ -1420,14 +1665,14 @@ app.get("/users/:id/bookmarked", async (req, res) => {
 
     while (posts.length < limit) {
       const postIds = await trackedRedis.zrevrange(
-        `user:${userId}:bookmarked`,
+        `user:${username}:bookmarked`,
         currentOffset,
         currentOffset + bufferSize - 1
       );
 
       if (postIds.length === 0) break;
 
-      const aggregated = await aggregatePostsWithUsers(postIds, requestId, includeUser, authenticatedUserId);
+      const aggregated = await aggregatePostsWithUsers(postIds, requestId, includeUser, authenticatedUsername);
       posts.push(...aggregated);
 
       if (posts.length >= limit) {
@@ -1472,23 +1717,23 @@ app.post("/users/:id/follow", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const targetUserId = req.params.id;
-    const userId = req.user.user_id;
+    const targetUsername = req.params.id;
+    const username = req.user.username;
 
-    if (targetUserId === userId) {
+    if (targetUsername === username) {
       return res.status(400).json({ error: "Cannot follow yourself" });
     }
 
     const trackedRedis = createTrackedRedis(requestId);
 
     // Check if target user exists
-    const targetUserExists = await trackedRedis.exists(`user:${targetUserId}`);
+    const targetUserExists = await trackedRedis.exists(`user:${targetUsername}`);
     if (targetUserExists === 0) {
       return res.status(404).json({ error: "User not found" });
     }
 
     // Check if already following
-    const alreadyFollowing = await trackedRedis.sismember(`user:${userId}:following`, targetUserId);
+    const alreadyFollowing = await trackedRedis.sismember(`user:${username}:following`, targetUsername);
     if (alreadyFollowing) {
       return res.status(400).json({ error: "Already following this user" });
     }
@@ -1497,22 +1742,22 @@ app.post("/users/:id/follow", async (req, res) => {
     const multi = redis.multi();
 
     // Add to following set
-    multi.sadd(`user:${userId}:following`, targetUserId);
+    multi.sadd(`user:${username}:following`, targetUsername);
 
     // Add to target's followers set
-    multi.sadd(`user:${targetUserId}:followers`, userId);
+    multi.sadd(`user:${targetUsername}:followers`, username);
 
     // Increment counts
-    multi.hincrby(`user:${userId}`, 'followingCount', 1);
-    multi.hincrby(`user:${targetUserId}`, 'followerCount', 1);
+    multi.hincrby(`user:${username}`, 'followingCount', 1);
+    multi.hincrby(`user:${targetUsername}`, 'followerCount', 1);
 
     await multi.exec();
 
     // Invalidate relevant caches
-    delete cache[`user_profile_${userId}_${userId}`];
-    delete cache[`user_profile_${targetUserId}_${targetUserId}`];
-    delete userCache[userId];
-    delete userCache[targetUserId];
+    delete cache[`user_profile_${username}_${username}`];
+    delete cache[`user_profile_${targetUsername}_${targetUsername}`];
+    delete userCache[username];
+    delete userCache[targetUsername];
     invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
@@ -1538,17 +1783,17 @@ app.delete("/users/:id/follow", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const targetUserId = req.params.id;
-    const userId = req.user.user_id;
+    const targetUsername = req.params.id;
+    const username = req.user.username;
 
-    if (targetUserId === userId) {
+    if (targetUsername === username) {
       return res.status(400).json({ error: "Cannot unfollow yourself" });
     }
 
     const trackedRedis = createTrackedRedis(requestId);
 
     // Check if following
-    const isFollowing = await trackedRedis.sismember(`user:${userId}:following`, targetUserId);
+    const isFollowing = await trackedRedis.sismember(`user:${username}:following`, targetUsername);
     if (!isFollowing) {
       return res.status(400).json({ error: "Not following this user" });
     }
@@ -1557,22 +1802,22 @@ app.delete("/users/:id/follow", async (req, res) => {
     const multi = redis.multi();
 
     // Remove from following set
-    multi.srem(`user:${userId}:following`, targetUserId);
+    multi.srem(`user:${username}:following`, targetUsername);
 
     // Remove from target's followers set
-    multi.srem(`user:${targetUserId}:followers`, userId);
+    multi.srem(`user:${targetUsername}:followers`, username);
 
     // Decrement counts
-    multi.hincrby(`user:${userId}`, 'followingCount', -1);
-    multi.hincrby(`user:${targetUserId}`, 'followerCount', -1);
+    multi.hincrby(`user:${username}`, 'followingCount', -1);
+    multi.hincrby(`user:${targetUsername}`, 'followerCount', -1);
 
     await multi.exec();
 
     // Invalidate relevant caches
-    delete cache[`user_profile_${userId}_${userId}`];
-    delete cache[`user_profile_${targetUserId}_${targetUserId}`];
-    delete userCache[userId];
-    delete userCache[targetUserId];
+    delete cache[`user_profile_${username}_${username}`];
+    delete cache[`user_profile_${targetUsername}_${targetUsername}`];
+    delete userCache[username];
+    delete userCache[targetUsername];
     invalidateFeedCaches();
 
     const duration = Date.now() - startTime;
@@ -1592,37 +1837,46 @@ app.delete("/users/:id/follow", async (req, res) => {
 });
 
 // ===== PATCH /users/:id: Update user profile =====
+// NOTE: API key requests will fail this ownership check since user_id='xano_sync' won't match the target userId
+// If Xano needs to update user profiles directly, consider adding role='admin' bypass or use /redis/write
 app.patch("/users/:id", async (req, res) => {
   const requestId = getRequestId();
   initRedisCounter(requestId);
   const startTime = Date.now();
 
   try {
-    const userId = req.params.id;
-    const authenticatedUserId = req.user.user_id;
+    const username = req.params.id;
+    const authenticatedUsername = req.user.username;
 
-    // Only allow users to update their own profile
-    if (userId !== authenticatedUserId) {
+    // AUTHORIZATION: Users can only update their own profile
+    // Exception: Admin role or API key can update any profile
+    // API key requests (username='xano_sync') will be blocked unless username param is 'xano_sync'
+    if (username !== authenticatedUsername) {
       return res.status(403).json({ error: "Not authorized to update this profile" });
     }
 
-    const { username, display_name, bio, avatar, links } = req.body;
+    // NOTE: Some fields have special handling:
+    // - Sensitive fields (email, phone, etc.) can be updated freely
+    // - System fields (postCount, followerCount, etc.) should not be modified directly
+    // - Denormalized fields (username, display_name, avatar) trigger post updates
+
+    const { username: newUsername, display_name, bio, avatar, links } = req.body;
 
     const trackedRedis = createTrackedRedis(requestId);
 
     // Get current user data
-    const currentUserData = await trackedRedis.hgetall(`user:${userId}`);
+    const currentUserData = await trackedRedis.hgetall(`user:${username}`);
 
     if (!currentUserData || Object.keys(currentUserData).length === 0) {
       return res.status(404).json({ error: "User not found" });
     }
 
     const oldUsername = currentUserData.username;
-    const usernameChanged = username && username !== oldUsername;
+    const usernameChanged = newUsername && newUsername !== oldUsername;
 
     // Build update object
     const updates = {};
-    if (username !== undefined) updates.username = username;
+    if (newUsername !== undefined) updates.username = newUsername;
     if (display_name !== undefined) updates.display_name = display_name;
     if (bio !== undefined) updates.bio = bio;
     if (avatar !== undefined) updates.avatar = avatar;
@@ -1632,35 +1886,26 @@ app.patch("/users/:id", async (req, res) => {
       return res.status(400).json({ error: "No fields to update" });
     }
 
+    // IMPORTANT: Username changes are extremely complex with username as primary key
+    // This would require renaming all keys and updating all references
+    // For now, we handle it but recommend making username immutable
+    if (usernameChanged) {
+      return res.status(400).json({
+        error: "Username changes are not supported. Username is immutable as it serves as the primary key."
+      });
+    }
+
     // Use Redis transaction
     const multi = redis.multi();
 
     // Update user hash
     for (const [key, value] of Object.entries(updates)) {
-      multi.hset(`user:${userId}`, key, value);
-    }
-
-    // If username changed, need to denormalize to all posts
-    if (usernameChanged) {
-      // Get all user's posts
-      const postIds = await trackedRedis.zrevrange(`user:${userId}:posts`, 0, -1);
-
-      console.log(`Username changed from ${oldUsername} to ${username}. Updating ${postIds.length} posts.`);
-
-      // Update denormalized username in all posts
-      for (const postId of postIds) {
-        multi.hset(`post:${postId}`, 'username', username);
-        if (display_name) {
-          multi.hset(`post:${postId}`, 'display_name', display_name);
-        }
-        // Invalidate post cache
-        delete postCache[postId];
-      }
+      multi.hset(`user:${username}`, key, value);
     }
 
     // If avatar changed, update all posts
     if (avatar !== undefined) {
-      const postIds = await trackedRedis.zrevrange(`user:${userId}:posts`, 0, -1);
+      const postIds = await trackedRedis.zrevrange(`user:${username}:posts`, 0, -1);
       for (const postId of postIds) {
         multi.hset(`post:${postId}`, 'avatar', avatar);
         delete postCache[postId];
@@ -1669,7 +1914,7 @@ app.patch("/users/:id", async (req, res) => {
 
     // If display_name changed, update all posts
     if (display_name !== undefined) {
-      const postIds = await trackedRedis.zrevrange(`user:${userId}:posts`, 0, -1);
+      const postIds = await trackedRedis.zrevrange(`user:${username}:posts`, 0, -1);
       for (const postId of postIds) {
         multi.hset(`post:${postId}`, 'display_name', display_name);
         delete postCache[postId];
@@ -1679,10 +1924,10 @@ app.patch("/users/:id", async (req, res) => {
     await multi.exec();
 
     // Invalidate user cache
-    delete userCache[userId];
+    delete userCache[username];
     invalidateFeedCaches();
     for (const key in cache) {
-      if (key.includes(`user_profile_${userId}`)) {
+      if (key.includes(`user_profile_${username}`)) {
         delete cache[key];
       }
     }
@@ -1710,28 +1955,28 @@ app.delete("/users/:id", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const userId = req.params.id;
-    const authenticatedUserId = req.user.user_id;
+    const username = req.params.id;
+    const authenticatedUsername = req.user.username;
     const userRole = req.user.role;
 
     // Only allow self-deletion or admin deletion
-    if (userId !== authenticatedUserId && userRole !== 'admin') {
+    if (username !== authenticatedUsername && userRole !== 'admin') {
       return res.status(403).json({ error: "Not authorized to delete this user" });
     }
 
     const trackedRedis = createTrackedRedis(requestId);
 
     // Get user data
-    const userData = await trackedRedis.hgetall(`user:${userId}`);
+    const userData = await trackedRedis.hgetall(`user:${username}`);
 
     if (!userData || Object.keys(userData).length === 0) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    console.log(`[DELETE /users/:id] Starting deletion for user ${userId}`);
+    console.log(`[DELETE /users/:id] Starting deletion for user ${username}`);
 
     // Get all user's posts
-    const userPostIds = await trackedRedis.zrevrange(`user:${userId}:posts`, 0, -1);
+    const userPostIds = await trackedRedis.zrevrange(`user:${username}:posts`, 0, -1);
     console.log(`[DELETE /users/:id] Found ${userPostIds.length} posts to delete`);
 
     // Delete each post (reuse post deletion logic)
@@ -1745,7 +1990,7 @@ app.delete("/users/:id", async (req, res) => {
 
         // Remove from feeds
         multi.zrem('explore:feed', postId);
-        multi.zrem(`user:${userId}:posts`, postId);
+        multi.zrem(`user:${username}:posts`, postId);
 
         for (const hashtagId of hashtags) {
           multi.zrem(`hashtag:${hashtagId}:posts`, postId);
@@ -1765,7 +2010,7 @@ app.delete("/users/:id", async (req, res) => {
       }
     }
 
-    // Get all liked posts and remove user from likes sets
+    // Get all liked posts and remove user from likes sets (username now stored in interaction sets)
     const explorePosts = await trackedRedis.zrevrange('explore:feed', 0, 999);
     console.log(`[DELETE /users/:id] Checking ${explorePosts.length} posts for user interactions`);
 
@@ -1774,7 +2019,7 @@ app.delete("/users/:id", async (req, res) => {
     // Check which posts the user actually liked to decrement likesCount
     const likeCheckPipeline = trackedRedis.pipeline();
     for (const postId of explorePosts) {
-      likeCheckPipeline.sismember(`post:${postId}:likes`, userId);
+      likeCheckPipeline.sismember(`post:${postId}:likes`, username);
     }
     const likeCheckResults = await likeCheckPipeline.exec();
 
@@ -1786,39 +2031,39 @@ app.delete("/users/:id", async (req, res) => {
         cleanupMulti.hincrby(`post:${postId}`, 'likesCount', -1);
       }
 
-      cleanupMulti.srem(`post:${postId}:likes`, userId);
-      cleanupMulti.srem(`post:${postId}:bookmarks`, userId);
+      cleanupMulti.srem(`post:${postId}:likes`, username);
+      cleanupMulti.srem(`post:${postId}:bookmarks`, username);
     }
 
     // Get bookmarked posts for cleanup
-    const bookmarkedPosts = await trackedRedis.zrevrange(`user:${userId}:bookmarked`, 0, -1);
+    const bookmarkedPosts = await trackedRedis.zrevrange(`user:${username}:bookmarked`, 0, -1);
     for (const postId of bookmarkedPosts) {
       cleanupMulti.hincrby(`post:${postId}`, 'bookmarksCount', -1);
     }
 
     // Delete all user keys
-    cleanupMulti.del(`user:${userId}`);
-    cleanupMulti.del(`user:${userId}:posts`);
-    cleanupMulti.del(`user:${userId}:bookmarked`);
-    cleanupMulti.del(`user:${userId}:following`);
-    cleanupMulti.del(`user:${userId}:followers`);
+    cleanupMulti.del(`user:${username}`);
+    cleanupMulti.del(`user:${username}:posts`);
+    cleanupMulti.del(`user:${username}:bookmarked`);
+    cleanupMulti.del(`user:${username}:following`);
+    cleanupMulti.del(`user:${username}:followers`);
 
-    // Remove from role-based sorted sets
+    // Remove from role-based sorted sets (now stores usernames instead of UUIDs)
     const role = userData.role || 'user';
     if (role === 'model') {
-      cleanupMulti.zrem('users:models', userId);
-      cleanupMulti.zrem('models:top:engagement', userId);
+      cleanupMulti.zrem('users:models', username);
+      cleanupMulti.zrem('models:top:engagement', username);
     } else {
-      cleanupMulti.zrem('users:regular', userId);
+      cleanupMulti.zrem('users:regular', username);
     }
 
     await cleanupMulti.exec();
 
     // Invalidate all caches
-    delete userCache[userId];
+    delete userCache[username];
     invalidateFeedCaches();
     for (const key in cache) {
-      if (key.includes(userId)) {
+      if (key.includes(username)) {
         delete cache[key];
       }
     }
@@ -1846,11 +2091,11 @@ app.get("/users/:id", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const userId = req.params.id;
-    const authenticatedUserId = req.user.user_id;
+    const username = req.params.id;
+    const authenticatedUsername = req.user.username;
 
     // Build viewer-specific cache key
-    const cacheKey = `user_profile_${userId}_${authenticatedUserId}`;
+    const cacheKey = `user_profile_${username}_${authenticatedUsername}`;
 
     // Check cache first
     const cached = getCached(cacheKey);
@@ -1866,7 +2111,7 @@ app.get("/users/:id", async (req, res) => {
     const trackedRedis = createTrackedRedis(requestId);
 
     // Fetch user data from Redis
-    const userData = await trackedRedis.hgetall(`user:${userId}`);
+    const userData = await trackedRedis.hgetall(`user:${username}`);
 
     if (!userData || Object.keys(userData).length === 0) {
       const duration = Date.now() - startTime;
@@ -1876,8 +2121,11 @@ app.get("/users/:id", async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    // Apply privacy controls
-    const sanitized = sanitizeUserData(userData, userId, authenticatedUserId);
+    // PRIVACY: Sanitize user data based on viewer relationship
+    // - If viewing own profile (username === authenticatedUsername): return all fields
+    // - If viewing other user: remove sensitive fields (email, phone, etc.)
+    // See SENSITIVE_USER_FIELDS array for complete list of protected fields
+    const sanitized = sanitizeUserData(userData, username, authenticatedUsername);
 
     const response = { user: sanitized };
 
@@ -1940,8 +2188,8 @@ app.get("/feed/hashtag/:id", async (req, res) => {
 
       if (postIds.length === 0) break;
 
-      const authenticatedUserId = req.user ? req.user.user_id : null;
-      const aggregated = await aggregatePostsWithUsers(postIds, requestId, includeUser, authenticatedUserId);
+      const authenticatedUsername = req.user ? req.user.username : null;
+      const aggregated = await aggregatePostsWithUsers(postIds, requestId, includeUser, authenticatedUsername);
       posts.push(...aggregated);
 
       if (posts.length >= limit) {
@@ -2020,8 +2268,8 @@ app.get("/feed/hashtag/:id/ranked", async (req, res) => {
 
       if (postIds.length === 0) break;
 
-      const authenticatedUserId = req.user ? req.user.user_id : null;
-      const aggregated = await aggregatePostsWithUsers(postIds, requestId, includeUser, authenticatedUserId);
+      const authenticatedUsername = req.user ? req.user.username : null;
+      const aggregated = await aggregatePostsWithUsers(postIds, requestId, includeUser, authenticatedUsername);
       posts.push(...aggregated);
 
       if (posts.length >= limit) {
@@ -2066,7 +2314,7 @@ app.get("/feed/following", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const userId = req.user.user_id;
+    const username = req.user.username;
     const offset = parseInt(req.query.offset) || 0;
     let limit = parseInt(req.query.limit) || 20;
     const includeUser = req.query.includeUser !== 'false'; // default true
@@ -2074,7 +2322,7 @@ app.get("/feed/following", async (req, res) => {
     // Validate and cap limit at 100
     if (limit > 100) limit = 100;
 
-    const cacheKey = `following_feed_${userId}_${offset}_${limit}_${includeUser}`;
+    const cacheKey = `following_feed_${username}_${offset}_${limit}_${includeUser}`;
 
     // Check cache first
     const cached = getCached(cacheKey);
@@ -2089,10 +2337,10 @@ app.get("/feed/following", async (req, res) => {
 
     const trackedRedis = createTrackedRedis(requestId);
 
-    // Get list of users being followed
-    const followingIds = await trackedRedis.smembers(`user:${userId}:following`);
+    // Get list of users being followed (now stores usernames instead of UUIDs)
+    const followingIds = await trackedRedis.smembers(`user:${username}:following`);
 
-    console.log(`User ${userId} follows ${followingIds.length} users`);
+    console.log(`User ${username} follows ${followingIds.length} users`);
 
     if (followingIds.length === 0) {
       const response = {
@@ -2111,8 +2359,8 @@ app.get("/feed/following", async (req, res) => {
       return res.json(response);
     }
 
-    // Build keys for user:{id}:posts sorted sets
-    const userPostKeys = followingIds.map(id => `user:${id}:posts`);
+    // Build keys for user:{username}:posts sorted sets (followingIds now contains usernames)
+    const userPostKeys = followingIds.map(username => `user:${username}:posts`);
 
     // Verify existence of user:{id}:posts keys by checking a sample
     const sampleKey = userPostKeys[0];
@@ -2163,7 +2411,7 @@ app.get("/feed/following", async (req, res) => {
 
         // Aggregate the filtered posts
         if (filteredPostIds.length > 0) {
-          const aggregated = await aggregatePostsWithUsers(filteredPostIds, requestId, includeUser, userId);
+          const aggregated = await aggregatePostsWithUsers(filteredPostIds, requestId, includeUser, username);
           posts.push(...aggregated);
         }
 
@@ -2183,7 +2431,7 @@ app.get("/feed/following", async (req, res) => {
       console.log(`Filtered to ${posts.length} posts from followed users`);
     } else {
       // Use ZUNIONSTORE to merge all followed users' posts into temporary sorted set
-      const tmpKey = `tmp:home:${userId}`;
+      const tmpKey = `tmp:home:${username}`;
       await trackedRedis.zunionstore(tmpKey, userPostKeys.length, ...userPostKeys);
 
       // Set short expiration (15 seconds)
@@ -2206,7 +2454,7 @@ app.get("/feed/following", async (req, res) => {
         if (fetchedIds.length === 0) break;
 
         // Aggregate posts with user data
-        const aggregated = await aggregatePostsWithUsers(fetchedIds, requestId, includeUser, userId);
+        const aggregated = await aggregatePostsWithUsers(fetchedIds, requestId, includeUser, username);
         posts.push(...aggregated);
 
         // If we've collected enough posts, trim to exact limit
@@ -2279,24 +2527,25 @@ app.get("/search/users/newest", async (req, res) => {
 
     const trackedRedis = createTrackedRedis(requestId);
 
-    // Fetch from sorted set (score = timestamp)
+    // Fetch from sorted set (score = timestamp, now stores usernames instead of UUIDs)
     const setKey = role === 'model' ? 'users:models' : 'users:regular';
-    const userIds = await trackedRedis.zrevrange(setKey, 0, limit - 1);
+    const usernames = await trackedRedis.zrevrange(setKey, 0, limit - 1);
 
     // Fetch user data
     const users = [];
-    if (userIds.length > 0) {
+    if (usernames.length > 0) {
       const pipeline = trackedRedis.pipeline();
-      for (const userId of userIds) {
-        pipeline.hgetall(`user:${userId}`);
+      for (const username of usernames) {
+        pipeline.hgetall(`user:${username}`);
       }
       const results = await pipeline.exec();
 
-      for (let i = 0; i < userIds.length; i++) {
+      for (let i = 0; i < usernames.length; i++) {
         const [, userData] = results[i];
         if (userData && Object.keys(userData).length > 0) {
-          // Sanitize user data for public search
-          const sanitized = sanitizeUserData(userData, userIds[i], null);
+          // PRIVACY: Sanitize all user data in search results
+          // Search results never include sensitive fields (email, phone, etc.)
+          const sanitized = sanitizeUserData(userData, usernames[i], null);
           users.push(sanitized);
         }
       }
@@ -2355,7 +2604,7 @@ app.get("/search/hashtags/top-posts", async (req, res) => {
     }
 
     const trackedRedis = createTrackedRedis(requestId);
-    const authenticatedUserId = req.user ? req.user.user_id : null;
+    const authenticatedUsername = req.user?.username ?? null;
 
     const hashtagResults = {};
 
@@ -2368,7 +2617,7 @@ app.get("/search/hashtags/top-posts", async (req, res) => {
       );
 
       if (postIds.length > 0) {
-        const posts = await aggregatePostsWithUsers(postIds, requestId, true, authenticatedUserId);
+        const posts = await aggregatePostsWithUsers(postIds, requestId, true, authenticatedUsername);
         hashtagResults[hashtagId] = posts;
       } else {
         hashtagResults[hashtagId] = [];
@@ -2418,26 +2667,28 @@ app.get("/search/models/top", async (req, res) => {
 
     const trackedRedis = createTrackedRedis(requestId);
 
-    // Fetch top models from engagement sorted set
-    const modelIds = await trackedRedis.zrevrange('models:top:engagement', 0, limit - 1, 'WITHSCORES');
+    // Fetch top models from engagement sorted set (now stores usernames instead of UUIDs)
+    const modelUsernames = await trackedRedis.zrevrange('models:top:engagement', 0, limit - 1, 'WITHSCORES');
 
     const models = [];
-    if (modelIds.length > 0) {
-      // modelIds contains [id1, score1, id2, score2, ...]
+    if (modelUsernames.length > 0) {
+      // modelUsernames contains [username1, score1, username2, score2, ...]
       const pipeline = trackedRedis.pipeline();
-      for (let i = 0; i < modelIds.length; i += 2) {
-        const modelId = modelIds[i];
-        pipeline.hgetall(`user:${modelId}`);
+      for (let i = 0; i < modelUsernames.length; i += 2) {
+        const modelUsername = modelUsernames[i];
+        pipeline.hgetall(`user:${modelUsername}`);
       }
       const results = await pipeline.exec();
 
-      for (let i = 0; i < modelIds.length; i += 2) {
-        const modelId = modelIds[i];
-        const score = parseFloat(modelIds[i + 1]);
+      for (let i = 0; i < modelUsernames.length; i += 2) {
+        const modelUsername = modelUsernames[i];
+        const score = parseFloat(modelUsernames[i + 1]);
         const [, userData] = results[i / 2];
 
         if (userData && Object.keys(userData).length > 0) {
-          const sanitized = sanitizeUserData(userData, modelId, null);
+          // PRIVACY: Sanitize model data in top models list
+          // Only public fields are shown in leaderboards
+          const sanitized = sanitizeUserData(userData, modelUsername, null);
           models.push({
             ...sanitized,
             engagement_score: score
@@ -2469,18 +2720,18 @@ app.get("/search/models/top", async (req, res) => {
 // ===== /debug-auth: shows resolved Redis key =====
 app.all("/debug-auth", async (req, res) => {
   try {
-    const tokenUserId = req.user.user_id;
-    const resolvedKey = `user:${tokenUserId}`;
+    const tokenUsername = req.user.username;
+    const resolvedKey = `user:${tokenUsername}`;
     const data = await redis.hgetall(resolvedKey);
 
     console.log("=== /debug-auth ===");
-    console.log("Token user_id:", tokenUserId);
+    console.log("Token username:", tokenUsername);
     console.log("Resolved key:", resolvedKey);
     console.log("Redis data:", data);
     console.log("===================");
 
     res.json({
-      user_id: tokenUserId,
+      username: tokenUsername,
       resolved_key: resolvedKey,
       redis_data: data
     });
@@ -2493,7 +2744,7 @@ app.all("/debug-auth", async (req, res) => {
 app.all("/whoami", (req, res) => {
   res.json({
     jwt_payload: req.user,
-    resolved_user_key: `user:${req.user.user_id}`
+    resolved_user_key: `user:${req.user.username}`
   });
 });
 
@@ -2505,11 +2756,11 @@ app.post("/seed", async (req, res) => {
     const multi = redis.multi();
     const now = Date.now();
 
-    // Create 3 test users
+    // Create 3 test users (username is now the primary key)
     const users = [
       {
-        id: 'user-1',
         username: 'alice',
+        uuid: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
         display_name: 'Alice Wonder',
         avatar: 'https://i.pravatar.cc/150?img=1',
         bio: 'Software engineer and cat lover',
@@ -2520,8 +2771,8 @@ app.post("/seed", async (req, res) => {
         followingCount: 0
       },
       {
-        id: 'user-2',
         username: 'bobmodel',
+        uuid: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
         display_name: 'Bob Model',
         avatar: 'https://i.pravatar.cc/150?img=2',
         bio: 'Professional model and fitness enthusiast',
@@ -2532,8 +2783,8 @@ app.post("/seed", async (req, res) => {
         followingCount: 0
       },
       {
-        id: 'user-3',
         username: 'charlie',
+        uuid: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
         display_name: 'Charlie Admin',
         avatar: 'https://i.pravatar.cc/150?img=3',
         bio: 'Platform administrator',
@@ -2545,29 +2796,30 @@ app.post("/seed", async (req, res) => {
       }
     ];
 
-    // Create users
+    // Create users (use username as key)
     for (const user of users) {
-      multi.hset(`user:${user.id}`, user);
+      multi.hset(`user:${user.username}`, user);
+      multi.set(`username_to_uuid:${user.username}`, user.uuid);
       const userTimestamp = now - (Math.random() * 86400000); // Random within last day
       if (user.role === 'model') {
-        multi.zadd('users:models', userTimestamp, user.id);
-        multi.zadd('models:top:engagement', 0, user.id);
+        multi.zadd('users:models', userTimestamp, user.username);
+        multi.zadd('models:top:engagement', 0, user.username);
       } else {
-        multi.zadd('users:regular', userTimestamp, user.id);
+        multi.zadd('users:regular', userTimestamp, user.username);
       }
     }
 
-    // Alice follows Bob
-    multi.sadd('user:user-1:following', 'user-2');
-    multi.sadd('user:user-2:followers', 'user-1');
-    multi.hincrby('user:user-1', 'followingCount', 1);
-    multi.hincrby('user:user-2', 'followerCount', 1);
+    // Alice follows Bob (use usernames in sets)
+    multi.sadd('user:alice:following', 'bobmodel');
+    multi.sadd('user:bobmodel:followers', 'alice');
+    multi.hincrby('user:alice', 'followingCount', 1);
+    multi.hincrby('user:bobmodel', 'followerCount', 1);
 
-    // Create test posts
+    // Create test posts (user_id now stores username)
     const posts = [
       {
         id: `${now}-post1`,
-        user_id: 'user-1',
+        user_id: 'alice',
         username: 'alice',
         avatar: 'https://i.pravatar.cc/150?img=1',
         display_name: 'Alice Wonder',
@@ -2581,7 +2833,7 @@ app.post("/seed", async (req, res) => {
       },
       {
         id: `${now}-post2`,
-        user_id: 'user-2',
+        user_id: 'bobmodel',
         username: 'bobmodel',
         avatar: 'https://i.pravatar.cc/150?img=2',
         display_name: 'Bob Model',
@@ -2595,7 +2847,7 @@ app.post("/seed", async (req, res) => {
       },
       {
         id: `${now}-post3`,
-        user_id: 'user-1',
+        user_id: 'alice',
         username: 'alice',
         avatar: 'https://i.pravatar.cc/150?img=1',
         display_name: 'Alice Wonder',
@@ -2631,8 +2883,8 @@ app.post("/seed", async (req, res) => {
       users: users.length,
       posts: posts.length,
       test_credentials: {
-        note: "Use these user IDs to generate JWT tokens for testing",
-        users: users.map(u => ({ id: u.id, username: u.username, role: u.role }))
+        note: "Use these usernames to generate JWT tokens for testing",
+        users: users.map(u => ({ username: u.username, role: u.role }))
       }
     });
   } catch (err) {

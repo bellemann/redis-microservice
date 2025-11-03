@@ -2,6 +2,18 @@
 
 A secure Redis-backed social media API with JWT-based authentication, denormalized data structures, and comprehensive feed/interaction endpoints.
 
+## Quick Links
+
+📚 **[Redis Key Structure Reference](./docs/REDIS_KEYS.md)** - Complete guide to all Redis keys, data types, and relationships
+
+🔄 **[Xano Sync Guide](./docs/XANO_SYNC_GUIDE.md)** - Step-by-step guide for syncing data from Xano to Redis
+
+💻 **[Frontend Integration Guide](./docs/FRONTEND_GUIDE.md)** - Guide for frontend developers using JWT authentication
+
+🔒 **[TLS Setup Guide](./docs/TLS_SETUP.md)** - Certificate generation and TLS configuration
+
+☁️ **[Redis Cloud TLS Guide](./docs/REDIS_CLOUD_TLS.md)** - Connecting to Redis Cloud with TLS
+
 ## Overview
 
 This microservice provides a comprehensive social media backend with:
@@ -15,6 +27,14 @@ This microservice provides a comprehensive social media backend with:
 - **Interaction Tracking**: isLiked/isBookmarked flags on all feed responses
 - **Multi-Layer Caching**: Post, user, and feed caching for optimal performance
 - **Time-Decayed Ranking**: Engagement-based scoring with 2-week TTL for trending content
+
+## Quick Start
+
+**For Frontend Developers:** Get started with JWT authentication and the `user:me` placeholder → [Frontend Integration Guide](./docs/FRONTEND_GUIDE.md)
+
+**For Backend/Xano Sync:** Learn how to sync data from Xano to Redis using API key authentication → [Xano Sync Guide](./docs/XANO_SYNC_GUIDE.md)
+
+**For Understanding Redis Keys:** Explore the complete Redis key structure and relationships → [Redis Key Structure Reference](./docs/REDIS_KEYS.md)
 
 ## Installation
 
@@ -32,8 +52,16 @@ cp .env.example .env
 ```
 REDIS_URL=redis://localhost:6379
 JWT_SECRET=your-secret-key-here
+XANO_API_KEY=your-xano-api-key-here
 PORT=3000
 ```
+
+**Generate a secure API key with:**
+```bash
+openssl rand -hex 32
+```
+
+**Note:** The API key is for server-to-server communication (Xano sync). See [Xano Sync Guide](./docs/XANO_SYNC_GUIDE.md) for detailed setup.
 
 ## Available Routes
 
@@ -56,6 +84,9 @@ PORT=3000
 - **`PATCH /posts/:id/ban`** - Ban a post (admin only)
 
 #### User Endpoints
+
+**Note:** The `:id` parameter is a username (not UUID). You can use `me` as the `:id` parameter to reference yourself (e.g., `/users/me`, `/users/me/bookmarked`).
+
 - **`GET /users/:id`** - Get user profile with privacy controls
 - **`PATCH /users/:id`** - Update user profile (self only)
 - **`DELETE /users/:id`** - Delete user account with cascading cleanup (self or admin)
@@ -100,10 +131,11 @@ All protected routes require a valid JWT token. The token can be provided in thr
 
 ### JWT Payload Requirements
 
-The JWT token must contain both `user_id` and `role` fields:
+The JWT token must contain `user_id`, `username`, and `role` fields:
 ```json
 {
   "user_id": "123",
+  "username": "alice",
   "role": "user",
   "iat": 1234567890,
   "exp": 1234568790
@@ -111,8 +143,11 @@ The JWT token must contain both `user_id` and `role` fields:
 ```
 
 **Required Fields:**
-- `user_id` - Unique identifier for the user
+- `user_id` - Legacy identifier (kept for backward compatibility)
+- `username` - **Username of the user (immutable, used as primary key)**
 - `role` - User role, must be one of: `admin`, `user`, or `model`
+
+**Note:** The `username` field is the primary identifier for users in Redis. User keys use the pattern `user:<username>` instead of `user:<uuid>`.
 
 The token must be signed with the `JWT_SECRET` configured in your `.env` file.
 
@@ -120,15 +155,41 @@ The token must be signed with the `JWT_SECRET` configured in your `.env` file.
 
 **Role Validation:** If the `role` field is missing or contains an invalid value, authentication will fail with a 401 error.
 
-## Placeholder Replacement
+### API Key Authentication (Xano Sync)
 
-The service automatically replaces `user:AUTH` with `user:{user_id}` in Redis commands, where `{user_id}` is extracted from the JWT token.
+For server-to-server communication, the service supports API key authentication as an alternative to JWT tokens.
 
-**Example:**
-- Request: `[["GET", "user:AUTH:following"]]`
-- Resolves to: `["GET", "user:123:following"]` (if user_id is "123")
+**Header Format:**
+```
+X-API-Key: your-api-key-here
+```
 
-This allows clients to query their own data without knowing their user_id in advance.
+**Key Features:**
+- Grants admin-level access and bypasses JWT authentication
+- Bypasses ownership checks on writes (can modify any user data via `/redis/write`)
+- GET endpoints still apply privacy sanitization (sensitive fields removed) unless viewing own profile
+- Used primarily for Xano synchronization operations
+- Should never be exposed in frontend code
+
+**Security Warning:** Keep the API key secret. Only use it from trusted backend services.
+
+For detailed setup and usage, see [Xano Sync Guide](./docs/XANO_SYNC_GUIDE.md).
+
+## Placeholder Replacement (`user:AUTH` and `user:me`)
+
+The service automatically replaces `user:AUTH` and `user:me` placeholders with `user:<username>` in Redis commands, where `<username>` is extracted from the JWT token.
+
+**Both Placeholders Supported:**
+- `user:me` - Recommended (more intuitive, follows REST conventions)
+- `user:AUTH` - Alternative (legacy support)
+
+**Examples:**
+- Request: `[["GET", "user:me:following"]]` or `[["GET", "user:AUTH:following"]]`
+- Resolves to: `["GET", "user:alice:following"]` (if username is "alice")
+
+**Note:** `user:me` is recommended for frontend developers as it's more intuitive and follows common REST API patterns (similar to `/users/me` endpoints).
+
+Both placeholders resolve to `user:<username>` from your JWT token, allowing clients to query their own data without hardcoding their username.
 
 ## User Profile Endpoint
 
@@ -139,7 +200,7 @@ Retrieves a user profile by ID with automatic privacy controls. Sensitive fields
 **Authentication:** Requires JWT token.
 
 **URL Parameters:**
-- `id` - User ID to retrieve
+- `id` - Username to retrieve (e.g., 'alice', not UUID). You can also use `me` as a shortcut to get your own profile.
 
 **Privacy Controls:**
 - When viewing **your own profile** (`id` matches authenticated `user_id`): All fields are returned
@@ -176,13 +237,17 @@ Retrieves a user profile by ID with automatic privacy controls. Sensitive fields
 
 **Example Requests:**
 ```bash
-# Get your own profile (all fields visible)
+# Get your own profile (all fields visible) - using 'me' shortcut
 curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  http://localhost:3000/users/your-user-id
+  http://localhost:3000/users/me
+
+# Get your own profile (using username)
+curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  http://localhost:3000/users/alice
 
 # Get another user's profile (sensitive fields removed)
 curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  http://localhost:3000/users/other-user-id
+  http://localhost:3000/users/bob
 ```
 
 **Example Response (Own Profile):**
@@ -319,7 +384,7 @@ Returns posts from users that the authenticated user follows, sorted by date (ne
 
 **Pagination Buffer:** Automatically fetches additional posts to ensure full pages even when some posts/users are missing.
 
-**Optimization:** Uses Redis `ZUNIONSTORE` to efficiently merge posts from all followed users, with fallback to `explore:feed` filtering if `user:{uuid}:posts` structures are not available.
+**Optimization:** Uses Redis `ZUNIONSTORE` to efficiently merge posts from all followed users. The system aggregates posts from all `user:<username>:posts` sorted sets, with fallback to `explore:feed` filtering if user post structures are not available.
 
 **Example Request:**
 ```bash
@@ -351,7 +416,7 @@ Create a new post with denormalized user data (username, avatar, display_name).
 **Response:** Created post object with denormalized user data.
 
 **Side Effects:**
-- Adds to `explore:feed`, `user:{user_id}:posts`, and `hashtag:{id}:posts` sorted sets
+- Adds to `explore:feed`, `user:<username>:posts`, and `hashtag:{id}:posts` sorted sets
 - Increments user's `postCount`
 - Initializes `hashtag:{id}:ranked` with score 0
 
@@ -386,7 +451,7 @@ Bookmark a post.
 
 **Side Effects:**
 - Adds user to `post:{id}:bookmarks` set
-- Adds post to `user:{user_id}:bookmarked` sorted set
+- Adds post to `user:<username>:bookmarked` sorted set
 - Increments `bookmarksCount` on post
 - Updates ranked feeds
 
@@ -421,12 +486,14 @@ Update user profile (username, display_name, bio, avatar, links).
 
 **Denormalization:** If username, display_name, or avatar changes, updates all user's posts automatically.
 
+**Note:** Username changes are not supported as username is immutable.
+
 #### POST /users/:id/follow
 Follow a user.
 
 **Side Effects:**
-- Adds to `user:{user_id}:following` set
-- Adds to `user:{target_id}:followers` set
+- Adds to `user:<username>:following` set
+- Adds to `user:<target_username>:followers` set
 - Increments `followingCount` and `followerCount`
 
 #### DELETE /users/:id
@@ -545,22 +612,24 @@ These flags are computed via batched `SISMEMBER` checks using Redis pipelines.
 
 ## Redis Data Structure
 
+**Note:** User keys use username as the primary identifier (immutable). The pattern is `user:<username>` instead of `user:<uuid>`.
+
 ### Core Data Keys
 
 - **`post:{id}`** - Hash
-  - Post data with denormalized user fields: `id`, `user_id`, `username`, `avatar`, `display_name`, `content`, `media_url`, `created_at`, `likesCount`, `commentsCount`, `bookmarksCount`
+  - Post data with denormalized user fields: `id`, `user_id` (username of post owner), `username`, `avatar`, `display_name`, `content`, `media_url`, `created_at`, `likesCount`, `commentsCount`, `bookmarksCount`
   - May include `banned`, `banned_at`, `banned_by` for banned posts
 
-- **`user:{id}`** - Hash
+- **`user:<username>`** - Hash
   - User profile: `username`, `display_name`, `bio`, `avatar`, `links`, `role`, `postCount`, `followerCount`, `followingCount`
   - Sensitive fields (only visible to self): `first_name`, `last_name`, `email`, `phone`, etc.
 
 ### Feed Sorted Sets (Score = Timestamp)
 
 - **`explore:feed`** - Global feed, all public posts
-- **`user:{id}:posts`** - All posts by a specific user
+- **`user:<username>:posts`** - All posts by a specific user
 - **`hashtag:{id}:posts`** - All posts with a specific hashtag (chronological)
-- **`user:{id}:bookmarked`** - User's bookmarked posts
+- **`user:<username>:bookmarked`** - User's bookmarked posts
 
 ### Engagement Sorted Sets (Score = Engagement Score)
 
@@ -569,19 +638,21 @@ These flags are computed via batched `SISMEMBER` checks using Redis pipelines.
 
 ### User Relationship Sets
 
-- **`user:{id}:following`** - Set of user IDs this user follows
-- **`user:{id}:followers`** - Set of user IDs following this user
+- **`user:<username>:following`** - Set of usernames this user follows
+- **`user:<username>:followers`** - Set of usernames following this user
 
 ### Interaction Sets
 
-- **`post:{id}:likes`** - Set of user IDs who liked this post
-- **`post:{id}:bookmarks`** - Set of user IDs who bookmarked this post
+- **`post:{id}:likes`** - Set of usernames who liked this post
+- **`post:{id}:bookmarks`** - Set of usernames who bookmarked this post
 - **`post:{id}:comments`** - Set/list of comment IDs on this post
 
 ### User Registry Sorted Sets (Score = Timestamp)
 
 - **`users:regular`** - All regular users (role = "user")
 - **`users:models`** - All model users (role = "model")
+
+**For detailed documentation of all Redis keys, see [Redis Key Structure Reference](./docs/REDIS_KEYS.md)**
 
 ## Performance Notes
 
@@ -610,11 +681,13 @@ All other Redis read commands are allowed by default.
 
 ### 2. Access Control
 Users can only access keys matching these patterns:
-- `user:{user_id}:*` - User-specific keys
-- `user:{user_id}` - User profile keys
+- `user:<your_username>:*` - User-specific keys (e.g., posts, followers, bookmarks)
+- `user:<your_username>` - Your own user profile hash
 - Public keys (no "user:" prefix)
 
-Attempts to access other users' keys (e.g., `user:456:*` when user_id is "123") are blocked with a 403 Forbidden error.
+**Important:** Direct reads of other users' profile hashes (e.g., `HGETALL user:bob`) are blocked to protect sensitive fields. To access other users' profiles, use the `GET /users/:id` endpoint which automatically sanitizes sensitive data.
+
+Attempts to access other users' keys are blocked with a 403 Forbidden error.
 
 ### 3. Sensitive Key Protection
 The following key patterns are blocked:
@@ -647,11 +720,12 @@ Only the following write commands are permitted:
 - `HDEL` - Delete hash field
 - `HINCRBY` - Increment hash field by integer
 
-### AUTH Placeholder
+### `user:AUTH` and `user:me` Placeholder
 
-- Use `user:AUTH` in commands to reference your own user data
-- Automatically replaced with `user:<your_user_id>` from JWT token
-- **Example:** `HSET user:AUTH bio "value"` becomes `HSET user:abc-123 bio "value"`
+- Use `user:me` (recommended) or `user:AUTH` in commands to reference your own user data
+- Automatically replaced with `user:<your_username>` from JWT token
+- **Example:** `HSET user:me bio "value"` becomes `HSET user:alice bio "value"`
+- **Note:** Both placeholders work identically, but `user:me` is more intuitive
 
 ### Security Restrictions
 
@@ -662,10 +736,12 @@ ERR command not allowed in write mode
 ```
 
 #### 2. Key Restriction
-Users can only modify keys matching the `user:<your_user_id>` pattern. Attempting to modify other users' data returns:
+Users can only modify keys matching the `user:<your_username>` pattern. Attempting to modify other users' data returns:
 ```
 ERR forbidden: can only modify your own user data
 ```
+
+**Note:** API key authentication bypasses ownership checks and allows modifying any user data (used for Xano sync).
 
 #### 3. Field Restrictions
 Certain fields cannot be modified directly and require using `PATCH /users/:id` instead:
@@ -831,11 +907,12 @@ curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
 Response:
 ```json
 {
-  "user_id": "123",
-  "resolved_key": "user:123",
+  "user_id": "alice",
+  "resolved_key": "user:alice",
   "redis_data": {
-    "name": "John Doe",
-    "email": "john@example.com"
+    "username": "alice",
+    "display_name": "Alice Smith",
+    "email": "alice@example.com"
   }
 }
 ```
@@ -845,7 +922,7 @@ Response:
 curl -X POST \
   -H "Authorization: Bearer YOUR_JWT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '[["GET", "user:AUTH:following"]]' \
+  -d '[["GET", "user:me:following"]]' \
   http://localhost:3000/
 ```
 
@@ -861,7 +938,7 @@ Response:
 curl -X POST \
   -H "Authorization: Bearer YOUR_JWT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '[["HGETALL", "user:AUTH"]]' \
+  -d '[["HGETALL", "user:me"]]' \
   http://localhost:3000/
 ```
 
@@ -869,8 +946,9 @@ Response:
 ```json
 [
   {
-    "name": "John Doe",
-    "email": "john@example.com",
+    "username": "alice",
+    "display_name": "Alice Smith",
+    "email": "alice@example.com",
     "created_at": "2024-01-01"
   }
 ]
@@ -881,7 +959,7 @@ Response:
 curl -X POST \
   -H "Authorization: Bearer YOUR_JWT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '[["SMEMBERS", "user:AUTH:followers"]]' \
+  -d '[["SMEMBERS", "user:me:followers"]]' \
   http://localhost:3000/
 ```
 
@@ -1016,6 +1094,18 @@ The logging helps identify:
 - Slow queries (high duration)
 - Redis roundtrip optimization opportunities
 - Endpoint usage patterns
+
+## Documentation
+
+📚 **[Redis Key Structure Reference](./docs/REDIS_KEYS.md)** - Complete reference of all Redis keys, data types, and relationships
+
+🔄 **[Xano Synchronization Guide](./docs/XANO_SYNC_GUIDE.md)** - Step-by-step guide for syncing data from Xano to Redis
+
+💻 **[Frontend Integration Guide](./docs/FRONTEND_GUIDE.md)** - Guide for frontend developers using JWT authentication
+
+🔒 **[TLS Setup Guide](./docs/TLS_SETUP.md)** - Certificate generation and TLS configuration
+
+☁️ **[Redis Cloud TLS Guide](./docs/REDIS_CLOUD_TLS.md)** - Connecting to Redis Cloud with TLS
 
 ## License
 
