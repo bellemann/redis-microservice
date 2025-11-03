@@ -485,13 +485,9 @@ async function aggregatePostsWithUsers(postIds, requestId, includeUser = true, a
         const [, isLiked] = interactionResults[likeIndex];
         const [, isBookmarked] = interactionResults[bookmarkIndex];
 
-        // Redis SISMEMBER returns 1 if member exists, 0 if not
-        const isLikedNum = parseInt(isLiked) || 0;
-        const isBookmarkedNum = parseInt(isBookmarked) || 0;
-
         interactionMap[postId] = {
-          isLiked: isLikedNum === 1,
-          isBookmarked: isBookmarkedNum === 1
+          isLiked: Boolean(isLiked),
+          isBookmarked: Boolean(isBookmarked)
         };
       }
     }
@@ -902,31 +898,31 @@ app.post("/posts/:id/like", async (req, res) => {
     multi.hincrby(`post:${postId}`, 'likesCount', 1);
 
     // Update ranked feeds if post has hashtags
-    const hashtags = extractHashtags(postData.content);
-    if (hashtags.length > 0) {
-      const currentTime = Date.now();
-      const createdAt = parseInt(postData.created_at);
+    const hashtagMatches = postData.content.match(/#(\w+)/g) || [];
+    if (hashtagMatches.length > 0) {
+      const currentTime = Date.now() / 1000; // Convert to seconds
+      const createdAt = parseInt(postData.created_at) / 1000;
       const likesCount = parseInt(postData.likesCount || 0) + 1;
       const commentsCount = parseInt(postData.commentsCount || 0);
       const bookmarksCount = parseInt(postData.bookmarksCount || 0);
 
       // Calculate time-decayed score
       const engagementScore = (likesCount * 3 + commentsCount * 5 + bookmarksCount * 4);
-      const ageInHours = (currentTime - createdAt) / 3600000;
+      const ageInHours = (currentTime - createdAt) / 3600;
       const score = engagementScore / (ageInHours + 1);
 
       // Check if post is older than 2 weeks
-      const twoWeeksInMs = 14 * 24 * 3600 * 1000;
-      const finalScore = (currentTime - createdAt) > twoWeeksInMs ? 0 : score;
+      const twoWeeksInSeconds = 14 * 24 * 3600;
+      const finalScore = (currentTime - createdAt) > twoWeeksInSeconds ? 0 : score;
 
-      for (const tag of hashtags) {
-        multi.zadd(`hashtag:${tag}:ranked`, finalScore, postId);
+      for (const tag of hashtagMatches) {
+        const hashtagId = tag.substring(1);
+        multi.zadd(`hashtag:${hashtagId}:ranked`, finalScore, postId);
       }
     }
 
     // Update models:top:engagement if post owner is a model
-    const authorRole = postData.user_role || await trackedRedis.hget(`user:${postData.user_id}`, 'role');
-    if (authorRole === 'model') {
+    if (postData.user_id && req.user.role === 'model') {
       multi.zincrby('models:top:engagement', 1, postData.user_id);
     }
 
@@ -988,29 +984,29 @@ app.delete("/posts/:id/like", async (req, res) => {
     multi.hincrby(`post:${postId}`, 'likesCount', -1);
 
     // Update ranked feeds if post has hashtags
-    const hashtags = extractHashtags(postData.content);
-    if (hashtags.length > 0) {
-      const currentTime = Date.now();
-      const createdAt = parseInt(postData.created_at);
+    const hashtagMatches = postData.content.match(/#(\w+)/g) || [];
+    if (hashtagMatches.length > 0) {
+      const currentTime = Date.now() / 1000;
+      const createdAt = parseInt(postData.created_at) / 1000;
       const likesCount = Math.max(0, parseInt(postData.likesCount || 0) - 1);
       const commentsCount = parseInt(postData.commentsCount || 0);
       const bookmarksCount = parseInt(postData.bookmarksCount || 0);
 
       const engagementScore = (likesCount * 3 + commentsCount * 5 + bookmarksCount * 4);
-      const ageInHours = (currentTime - createdAt) / 3600000;
+      const ageInHours = (currentTime - createdAt) / 3600;
       const score = engagementScore / (ageInHours + 1);
 
-      const twoWeeksInMs = 14 * 24 * 3600 * 1000;
-      const finalScore = (currentTime - createdAt) > twoWeeksInMs ? 0 : score;
+      const twoWeeksInSeconds = 14 * 24 * 3600;
+      const finalScore = (currentTime - createdAt) > twoWeeksInSeconds ? 0 : score;
 
-      for (const tag of hashtags) {
-        multi.zadd(`hashtag:${tag}:ranked`, finalScore, postId);
+      for (const tag of hashtagMatches) {
+        const hashtagId = tag.substring(1);
+        multi.zadd(`hashtag:${hashtagId}:ranked`, finalScore, postId);
       }
     }
 
     // Update models:top:engagement if post owner is a model
-    const authorRole = postData.user_role || await trackedRedis.hget(`user:${postData.user_id}`, 'role');
-    if (authorRole === 'model') {
+    if (postData.user_id && req.user.role === 'model') {
       multi.zincrby('models:top:engagement', -1, postData.user_id);
     }
 
@@ -1076,29 +1072,29 @@ app.post("/posts/:id/bookmark", async (req, res) => {
     multi.hincrby(`post:${postId}`, 'bookmarksCount', 1);
 
     // Update ranked feeds if post has hashtags
-    const hashtags = extractHashtags(postData.content);
-    if (hashtags.length > 0) {
-      const currentTime = Date.now();
-      const createdAt = parseInt(postData.created_at);
+    const hashtagMatches = postData.content.match(/#(\w+)/g) || [];
+    if (hashtagMatches.length > 0) {
+      const currentTime = Date.now() / 1000;
+      const createdAt = parseInt(postData.created_at) / 1000;
       const likesCount = parseInt(postData.likesCount || 0);
       const commentsCount = parseInt(postData.commentsCount || 0);
       const bookmarksCount = parseInt(postData.bookmarksCount || 0) + 1;
 
       const engagementScore = (likesCount * 3 + commentsCount * 5 + bookmarksCount * 4);
-      const ageInHours = (currentTime - createdAt) / 3600000;
+      const ageInHours = (currentTime - createdAt) / 3600;
       const score = engagementScore / (ageInHours + 1);
 
-      const twoWeeksInMs = 14 * 24 * 3600 * 1000;
-      const finalScore = (currentTime - createdAt) > twoWeeksInMs ? 0 : score;
+      const twoWeeksInSeconds = 14 * 24 * 3600;
+      const finalScore = (currentTime - createdAt) > twoWeeksInSeconds ? 0 : score;
 
-      for (const tag of hashtags) {
-        multi.zadd(`hashtag:${tag}:ranked`, finalScore, postId);
+      for (const tag of hashtagMatches) {
+        const hashtagId = tag.substring(1);
+        multi.zadd(`hashtag:${hashtagId}:ranked`, finalScore, postId);
       }
     }
 
     // Update models:top:engagement if post owner is a model
-    const authorRole = postData.user_role || await trackedRedis.hget(`user:${postData.user_id}`, 'role');
-    if (authorRole === 'model') {
+    if (postData.user_id && req.user.role === 'model') {
       multi.zincrby('models:top:engagement', 1, postData.user_id);
     }
 
@@ -1163,29 +1159,29 @@ app.delete("/posts/:id/bookmark", async (req, res) => {
     multi.hincrby(`post:${postId}`, 'bookmarksCount', -1);
 
     // Update ranked feeds if post has hashtags
-    const hashtags = extractHashtags(postData.content);
-    if (hashtags.length > 0) {
-      const currentTime = Date.now();
-      const createdAt = parseInt(postData.created_at);
+    const hashtagMatches = postData.content.match(/#(\w+)/g) || [];
+    if (hashtagMatches.length > 0) {
+      const currentTime = Date.now() / 1000;
+      const createdAt = parseInt(postData.created_at) / 1000;
       const likesCount = parseInt(postData.likesCount || 0);
       const commentsCount = parseInt(postData.commentsCount || 0);
       const bookmarksCount = Math.max(0, parseInt(postData.bookmarksCount || 0) - 1);
 
       const engagementScore = (likesCount * 3 + commentsCount * 5 + bookmarksCount * 4);
-      const ageInHours = (currentTime - createdAt) / 3600000;
+      const ageInHours = (currentTime - createdAt) / 3600;
       const score = engagementScore / (ageInHours + 1);
 
-      const twoWeeksInMs = 14 * 24 * 3600 * 1000;
-      const finalScore = (currentTime - createdAt) > twoWeeksInMs ? 0 : score;
+      const twoWeeksInSeconds = 14 * 24 * 3600;
+      const finalScore = (currentTime - createdAt) > twoWeeksInSeconds ? 0 : score;
 
-      for (const tag of hashtags) {
-        multi.zadd(`hashtag:${tag}:ranked`, finalScore, postId);
+      for (const tag of hashtagMatches) {
+        const hashtagId = tag.substring(1);
+        multi.zadd(`hashtag:${hashtagId}:ranked`, finalScore, postId);
       }
     }
 
     // Update models:top:engagement if post owner is a model
-    const authorRole = postData.user_role || await trackedRedis.hget(`user:${postData.user_id}`, 'role');
-    if (authorRole === 'model') {
+    if (postData.user_id && req.user.role === 'model') {
       multi.zincrby('models:top:engagement', -1, postData.user_id);
     }
 
