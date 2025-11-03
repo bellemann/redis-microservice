@@ -5,7 +5,8 @@
 # Use with VS Code REST Client extension or similar tools.
 #
 # To use these examples:
-# 1. Generate a JWT token: node generate-test-token.js <user_id>
+# 1. Generate a JWT token: node generate-test-token.js [user_id] [role]
+#    Example: node generate-test-token.js 123 user
 # 2. Replace <your-jwt-token-here> below with your token
 # 3. Click "Send Request" above each request
 ###
@@ -225,6 +226,36 @@ Authorization: Bearer {{token}}
 
 ### GET /feed/following - Following feed (only 5 posts)
 GET {{baseUrl}}/feed/following?limit=5
+Authorization: Bearer {{token}}
+
+### GET /feed/explore - Explore feed WITHOUT user data (faster)
+GET {{baseUrl}}/feed/explore?limit=10&includeUser=false
+Authorization: Bearer {{token}}
+
+### GET /feed/following - Following feed WITHOUT user data (faster)
+GET {{baseUrl}}/feed/following?limit=10&includeUser=false
+Authorization: Bearer {{token}}
+
+###############################################################################
+# USER PROFILE ENDPOINT
+###############################################################################
+
+### GET /users/:id - Get your own profile (all fields visible)
+# Replace "your-user-id" with your actual user ID from the JWT token
+GET {{baseUrl}}/users/your-user-id
+Authorization: Bearer {{token}}
+
+### GET /users/:id - Get another user's profile (sensitive fields removed)
+# Replace "other-user-id" with another user's ID
+GET {{baseUrl}}/users/other-user-id
+Authorization: Bearer {{token}}
+
+### GET /users/:id - Get user profile (example with UUID)
+GET {{baseUrl}}/users/123e4567-e89b-12d3-a456-426614174000
+Authorization: Bearer {{token}}
+
+### ERROR: GET /users/:id - User not found (404)
+GET {{baseUrl}}/users/nonexistent-user-id
 Authorization: Bearer {{token}}
 
 ###############################################################################

@@ -45,6 +45,7 @@ PORT=3000
 - **`POST /`** - Redis proxy endpoint for executing Redis commands
 - **`GET/POST /whoami`** - Returns the decoded JWT payload
 - **`GET/POST /debug-auth`** - Tests Redis key resolution with placeholder replacement
+- **`GET /users/:id`** - Get user profile with privacy controls
 - **`GET /feed/following`** - Following feed (posts from followed users, paginated)
 
 ## JWT Authentication
@@ -68,18 +69,25 @@ All protected routes require a valid JWT token. The token can be provided in thr
 
 ### JWT Payload Requirements
 
-The JWT token must contain a `user_id` field:
+The JWT token must contain both `user_id` and `role` fields:
 ```json
 {
   "user_id": "123",
+  "role": "user",
   "iat": 1234567890,
   "exp": 1234568790
 }
 ```
 
+**Required Fields:**
+- `user_id` - Unique identifier for the user
+- `role` - User role, must be one of: `admin`, `user`, or `model`
+
 The token must be signed with the `JWT_SECRET` configured in your `.env` file.
 
 **Token Expiration:** Tokens expire after 900 seconds (15 minutes). The service automatically validates the expiration time.
+
+**Role Validation:** If the `role` field is missing or contains an invalid value, authentication will fail with a 401 error.
 
 ## Placeholder Replacement
 
@@ -90,6 +98,90 @@ The service automatically replaces `user:AUTH` with `user:{user_id}` in Redis co
 - Resolves to: `["GET", "user:123:following"]` (if user_id is "123")
 
 This allows clients to query their own data without knowing their user_id in advance.
+
+## User Profile Endpoint
+
+### GET /users/:id
+
+Retrieves a user profile by ID with automatic privacy controls. Sensitive fields are automatically filtered based on the relationship between the authenticated user and the requested profile.
+
+**Authentication:** Requires JWT token.
+
+**URL Parameters:**
+- `id` - User ID to retrieve
+
+**Privacy Controls:**
+- When viewing **your own profile** (`id` matches authenticated `user_id`): All fields are returned
+- When viewing **other users' profiles**: Sensitive fields are automatically removed
+
+**Sensitive Fields (removed for other users):**
+- `first_name`, `last_name`
+- `email`, `phone`, `phone_number`
+- `address`, `date_of_birth`, `birth_date`
+- `password`, `password_hash`
+- `ssn`, `credit_card`, `bank_account`
+- `ip_address`, `device_id`
+
+**Response Format:**
+```json
+{
+  "user": {
+    "uuid": "user-uuid-123",
+    "username": "johndoe",
+    "display_name": "John Doe",
+    "bio": "Software developer",
+    "avatar": "https://example.com/avatar.jpg"
+  }
+}
+```
+
+**Caching:** Results are cached for 300 seconds (5 minutes) with viewer-specific cache keys to ensure privacy.
+
+**Status Codes:**
+- `200 OK` - User found and returned
+- `404 Not Found` - User does not exist
+- `401 Unauthorized` - Invalid or missing JWT token
+- `500 Internal Server Error` - Server error
+
+**Example Requests:**
+```bash
+# Get your own profile (all fields visible)
+curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  http://localhost:3000/users/your-user-id
+
+# Get another user's profile (sensitive fields removed)
+curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  http://localhost:3000/users/other-user-id
+```
+
+**Example Response (Own Profile):**
+```json
+{
+  "user": {
+    "uuid": "123",
+    "username": "johndoe",
+    "display_name": "John Doe",
+    "email": "john@example.com",
+    "phone": "+1234567890",
+    "bio": "Software developer",
+    "created_at": "2025-01-01T00:00:00Z"
+  }
+}
+```
+
+**Example Response (Other User's Profile):**
+```json
+{
+  "user": {
+    "uuid": "456",
+    "username": "janedoe",
+    "display_name": "Jane Doe",
+    "bio": "Designer",
+    "created_at": "2025-01-01T00:00:00Z"
+  }
+}
+```
+*Note: `email` and `phone` fields are removed for privacy*
 
 ## Feed Endpoints
 
@@ -395,6 +487,14 @@ curl -X POST \
 ```
 Note: Tokens expire after 15 minutes (900 seconds).
 
+### 401 Unauthorized (Invalid or Missing Role)
+```json
+{
+  "error": "Invalid or missing role in token"
+}
+```
+Note: JWT tokens must include a valid `role` field (admin, user, or model).
+
 ### 403 Forbidden (Access to Other User's Data)
 ```json
 {
@@ -430,15 +530,33 @@ The server will start on the port specified in your `.env` file (default: 3000).
 Use the included `generate-test-token.js` script to create JWT tokens for testing:
 
 ```bash
-node generate-test-token.js <user_id>
+node generate-test-token.js [user_id] [role]
 ```
 
-Example:
+**Parameters:**
+- `user_id` (optional, default: `test-user-123`) - User identifier
+- `role` (optional, default: `user`) - User role (`admin`, `user`, or `model`)
+
+**Examples:**
 ```bash
-node generate-test-token.js 123
+# Generate token for regular user
+node generate-test-token.js 123 user
+
+# Generate token for admin
+node generate-test-token.js 456 admin
+
+# Generate token for model
+node generate-test-token.js 789 model
+
+# Use defaults (test-user-123, user)
+node generate-test-token.js
 ```
 
-This will output a JWT token you can use for testing.
+The script will output:
+- User ID and role
+- JWT token (valid for 15 minutes)
+- Decoded payload
+- Example cURL commands for testing
 
 ## Docker
 
@@ -455,20 +573,51 @@ docker run -p 3000:3000 \
   redis-microservice
 ```
 
-## Logging
+## Logging & Monitoring
 
-The service logs all requests to the console with the following information:
-- Timestamp
-- HTTP method and path
-- Authenticated user_id (for protected routes)
-- Original and resolved Redis commands (for proxy requests)
+The service provides detailed logging and Redis request tracking for all endpoints.
 
-Example log output:
+### Request Tracking
+
+Every request is assigned a unique request ID and tracks:
+- **Redis Commands** - Individual Redis operations (GET, HGETALL, etc.)
+- **Redis Pipelines** - Batched Redis operations
+- **Request Duration** - Total time in milliseconds
+- **Cache Hits/Misses** - Memory cache effectiveness
+
+### Log Format
+
+**Feed Endpoints:**
 ```
-[2024-01-01T12:00:00.000Z] POST / - User: 123
-Original command: ["GET","user:AUTH:following"]
-Resolved command: ["GET","user:123:following"]
+✅ [GET /feed/explore] Success | Duration: 45ms | Redis: 2 commands, 1 pipelines | Total: 3 roundtrips | includeUser: true
+✅ [GET /feed/explore] CACHE HIT | Duration: 2ms | Redis: 0 commands, 0 pipelines | includeUser: true
 ```
+
+**User Profile Endpoint:**
+```
+✅ [GET /users/:id] Success | Duration: 12ms | Redis: 1 commands, 0 pipelines | Total: 1 roundtrips
+✅ [GET /users/:id] CACHE HIT | Duration: 1ms | Redis: 0 commands, 0 pipelines
+❌ [GET /users/:id] User not found | Duration: 8ms | Redis: 1 commands, 0 pipelines
+```
+
+**Redis Proxy Requests:**
+```
+=== Redis Request ===
+JWT user_id: 123
+Command: GET
+Original args: ["user:AUTH:following"]
+Resolved args: ["user:123:following"]
+Redis result: ["456", "789"]
+=====================
+```
+
+### Performance Insights
+
+The logging helps identify:
+- Cache hit rates (0 Redis commands = cache hit)
+- Slow queries (high duration)
+- Redis roundtrip optimization opportunities
+- Endpoint usage patterns
 
 ## License
 
