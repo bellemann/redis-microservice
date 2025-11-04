@@ -427,6 +427,8 @@ app.get("/feed/explore", async (req, res) => {
 });
 
 // ===== API KEY AUTHENTICATION HELPER =====
+// WARNING: API key grants unrestricted Redis access. Ensure it's kept secret and only used by trusted backend services (Xano).
+// Consider implementing rate limiting for API key requests in production.
 function authenticateApiKey(req) {
   // Check for X-API-Key header (case-insensitive)
   const apiKey = req.headers['x-api-key'] || req.headers['X-API-Key'];
@@ -439,31 +441,39 @@ function authenticateApiKey(req) {
 }
 
 // ===== DUAL AUTHENTICATION MIDDLEWARE (JWT OR API KEY) =====
+// JWT authentication: For REST endpoints (users, posts, feeds, etc.) - frontend clients
+// API key authentication: For Redis proxy endpoints (Xano sync only) - backend services
 app.use((req, res, next) => {
   // Allow CORS preflight requests through without auth
   if (req.method === "OPTIONS") return next();
 
   // 1. Attempt API Key Authentication First
-  if (authenticateApiKey(req)) {
-    // Log successful API key authentication (without revealing key)
-    console.log(`✓ API Key authentication successful for ${req.method} ${req.path}`);
+  // API key grants access to Redis proxy endpoints for backend sync operations
+  // Frontend clients use JWT for REST endpoints only
+  const apiKeyHeader = req.headers['x-api-key'] || req.headers['X-API-Key'];
 
-    // Set special admin user object for API key requests
-    // API KEY PRIVILEGE: Bypasses ownership checks for writes
-    // Note: GET endpoints still enforce privacy via sanitizeUserData() unless explicitly changed
-    // Used for Xano sync to read/write any user data
-    req.user = {
-      user_id: 'xano_sync',
-      username: 'xano_sync',
-      role: 'admin',
-      isApiKey: true  // This flag bypasses ownership checks on writes
-    };
-    return next();
-  }
+  if (apiKeyHeader) {
+    // X-API-Key header is present - validate it
+    if (authenticateApiKey(req)) {
+      // Log successful API key authentication (without revealing key)
+      console.log(`✓ API Key authentication successful for ${req.method} ${req.path}`);
 
-  // Log failed API key attempt if X-API-Key header was present
-  if (req.headers['x-api-key'] || req.headers['X-API-Key']) {
-    console.warn(`⚠ Failed API key authentication attempt for ${req.method} ${req.path}`);
+      // Set special admin user object for API key requests
+      // API KEY PRIVILEGE: Bypasses ownership checks for writes
+      // Note: GET endpoints still enforce privacy via sanitizeUserData() unless explicitly changed
+      // Used for Xano sync to read/write any user data
+      req.user = {
+        user_id: 'xano_sync',
+        username: 'xano_sync',
+        role: 'admin',
+        isApiKey: true  // This flag bypasses ownership checks on writes
+      };
+      return next();
+    } else {
+      // X-API-Key header present but invalid - return 401 immediately
+      console.warn(`⚠ Invalid API key attempt for ${req.method} ${req.path}`);
+      return res.status(401).json({ error: "Invalid API key" });
+    }
   }
 
   // 2. Fall Back to JWT Authentication
@@ -721,7 +731,8 @@ async function aggregatePostsWithUsers(postIds, requestId, includeUser = true, a
   return results;
 }
 
-// ===== Read‑only Redis proxy endpoint =====
+// ===== Read‑only Redis proxy endpoint (API key only) =====
+// Frontend clients should use REST endpoints instead
 app.post("/", async (req, res) => {
   let commands = req.body;
   if (!Array.isArray(commands)) {
@@ -735,6 +746,23 @@ app.post("/", async (req, res) => {
   const results = [];
   const tokenUsername = req.user.username;
   const isApiKeyAuth = req.user.isApiKey === true;
+
+  // SECURITY: Restrict Redis proxy to API key authentication only
+  // Frontend clients must use REST endpoints for proper authorization and validation
+  if (!isApiKeyAuth) {
+    return res.status(403).json({
+      error: "Redis proxy access requires API key authentication",
+      message: "Frontend clients should use REST endpoints instead",
+      availableEndpoints: [
+        "GET /users/:id - Get user profile",
+        "PATCH /users/:id - Update profile",
+        "POST /posts - Create post",
+        "GET /feed/explore - Get explore feed",
+        "GET /feed/following - Get following feed"
+      ],
+      documentation: "See docs/FRONTEND_GUIDE.md for frontend integration"
+    });
+  }
 
   for (const [cmdRaw, ...args] of commands) {
     const cmd = cmdRaw.toUpperCase();
@@ -759,23 +787,24 @@ app.post("/", async (req, res) => {
     }
 
     try {
-      // Replace user:AUTH and user:me placeholders in key positions only (only for JWT auth, API key clients should provide explicit keys)
+      // Replace user:me placeholder in key positions (API key only, resolves to user:xano_sync)
+      // Note: Since only API key reaches this point, placeholder support is minimal
       // Multi-key commands that accept multiple keys as arguments
       const multiKeyCommands = ["MGET", "DEL", "EXISTS", "TOUCH", "UNLINK", "SUNION", "SINTER", "SDIFF", "ZUNION", "ZINTER", "ZDIFF"];
 
       const argsProcessed = args.map((a, index) => {
-        if (typeof a !== "string" || isApiKeyAuth) {
+        if (typeof a !== "string") {
           return a;
         }
 
         // For multi-key commands, apply replacement to all string arguments (they're all keys)
         if (multiKeyCommands.includes(cmd)) {
-          return a.replace(/^user:(AUTH|me)(?=$|:)/, `user:${tokenUsername}`);
+          return a.replace(/^user:me(?=$|:)/, `user:${tokenUsername}`);
         }
 
         // For single-key commands, only replace the first argument (the key)
         if (index === 0) {
-          return a.replace(/^user:(AUTH|me)(?=$|:)/, `user:${tokenUsername}`);
+          return a.replace(/^user:me(?=$|:)/, `user:${tokenUsername}`);
         }
 
         return a;
@@ -794,27 +823,8 @@ app.post("/", async (req, res) => {
         }
       }
 
-      // Block direct reads of other users' hashes for HGETALL/HGET/HMGET
-      // These commands can expose sensitive fields (email, phone, etc.)
-      // Other users' profile hashes must be accessed via GET /users/:id which applies sanitization
-      if (
-        argsProcessed.length > 0 &&
-        typeof argsProcessed[0] === "string" &&
-        ["HGETALL", "HGET", "HMGET"].includes(cmd)
-      ) {
-        const key = argsProcessed[0];
-        // Match user:<username> (exact hash key) or user:<username>:* for sensitive sub-keys
-        const userHashMatch = key.match(/^user:([^:]+)(?::.*)?$/);
-
-        if (userHashMatch) {
-          const keyUsername = userHashMatch[1];
-          // Only block if trying to access another user's data and not using API key
-          if (!isApiKeyAuth && keyUsername !== tokenUsername) {
-            results.push("ERR forbidden: private resource");
-            continue;
-          }
-        }
-      }
+      // Note: API key authentication allows reading any user data for backend sync operations
+      // Validation of key formats is still performed below
 
       // Block sensitive keys like otp:* and session*
       if (
@@ -829,8 +839,7 @@ app.post("/", async (req, res) => {
       }
 
       // Console logging for debug
-      console.log("=== Redis Request ===");
-      console.log("Auth method:", isApiKeyAuth ? "API Key" : "JWT");
+      console.log("=== Redis Request (API Key) ===");
       console.log("Username:", req.user.username);
       console.log("Command:", cmdRaw);
       console.log("Original args:", args);
@@ -851,7 +860,8 @@ app.post("/", async (req, res) => {
   res.json(results);
 });
 
-// ===== POST /redis/write: Write-enabled Redis proxy with AUTH placeholder =====
+// ===== POST /redis/write: Write-enabled Redis proxy (API key only) =====
+// Frontend clients should use REST endpoints for writes
 app.post("/redis/write", async (req, res) => {
   const requestId = getRequestId();
   initRedisCounter(requestId);
@@ -864,6 +874,23 @@ app.post("/redis/write", async (req, res) => {
 
     if (!Array.isArray(commands) || commands.length === 0) {
       return res.status(400).json({ error: "Request body must be a non-empty array of commands" });
+    }
+
+    // SECURITY: Restrict Redis write proxy to API key authentication only
+    // Frontend clients must use REST endpoints for proper authorization and validation
+    if (!isApiKeyAuth) {
+      return res.status(403).json({
+        error: "Redis write proxy requires API key authentication",
+        message: "Frontend clients should use REST endpoints like PATCH /users/:id instead",
+        availableEndpoints: [
+          "PATCH /users/:id - Update user profile",
+          "POST /posts - Create post",
+          "POST /posts/:id/like - Like post",
+          "POST /posts/:id/bookmark - Bookmark post",
+          "POST /users/:username/follow - Follow user"
+        ],
+        documentation: "See docs/FRONTEND_GUIDE.md for frontend integration"
+      });
     }
 
     // Whitelist of allowed write commands
@@ -900,14 +927,15 @@ app.post("/redis/write", async (req, res) => {
       }
 
       try {
-        // Replace user:AUTH and user:me placeholders in key argument only (only for JWT auth, API key clients should provide explicit keys)
+        // Replace user:me placeholder in key argument only (API key only, resolves to user:xano_sync)
+        // Note: Since only API key reaches this point, recommend using explicit usernames instead
         const argsProcessed = args.map((a, index) =>
-          index === 0 && typeof a === "string" && !isApiKeyAuth
-            ? a.replace(/^user:(AUTH|me)(?=$|:)/, `user:${tokenUsername}`)
+          index === 0 && typeof a === "string"
+            ? a.replace(/^user:me(?=$|:)/, `user:${tokenUsername}`)
             : a
         );
 
-        // Authorization check: validate key format and ownership
+        // Authorization check: validate key format
         if (argsProcessed.length > 0 && typeof argsProcessed[0] === "string") {
           const key = argsProcessed[0];
 
@@ -919,19 +947,12 @@ app.post("/redis/write", async (req, res) => {
             continue;
           }
 
-          const keyUsername = userKeyMatch[1];
-
-          // For JWT auth: Ensure user can only modify their own data
-          // For API key auth: Allow modification but still validate user: pattern
-          if (!isApiKeyAuth && keyUsername !== tokenUsername) {
-            results.push("ERR forbidden: can only modify your own user data");
-            continue;
-          }
+          // API key authentication allows modifying any user data (for backend sync operations)
         }
 
         // Field restriction check for HSET and HDEL commands
-        // NOTE: These restrictions apply to BOTH JWT and API key requests to ensure data consistency
-        // API key requests could bypass this in the future if needed for Xano sync edge cases
+        // NOTE: These restrictions apply to API key requests to ensure data consistency
+        // Could be relaxed in the future if needed for Xano sync edge cases
         if (cmd === "HSET" && argsProcessed.length >= 2) {
           const fieldName = argsProcessed[1];
           if (blockedFields.includes(fieldName)) {
@@ -959,8 +980,7 @@ app.post("/redis/write", async (req, res) => {
         }
 
         // Console logging for debug
-        console.log("=== Redis Write Request ===");
-        console.log("Auth method:", isApiKeyAuth ? "API Key (admin)" : "JWT");
+        console.log("=== Redis Write Request (API Key - Admin) ===");
         console.log("Username:", req.user.username);
         console.log("Command:", cmdRaw);
         console.log("Original args:", args);
@@ -1625,14 +1645,20 @@ app.delete("/posts/:id/bookmark", async (req, res) => {
 });
 
 // ===== GET /users/:id/bookmarked: Get user's bookmarked posts =====
+// Supports 'me' as :id parameter to fetch own bookmarks
 app.get("/users/:id/bookmarked", async (req, res) => {
   const requestId = getRequestId();
   initRedisCounter(requestId);
   const startTime = Date.now();
 
   try {
-    const username = req.params.id;
+    let username = req.params.id;
     const authenticatedUsername = req.user.username;
+
+    // Resolve 'me' placeholder to authenticated username
+    if (username === 'me') {
+      username = authenticatedUsername;
+    }
 
     // Only allow users to view their own bookmarks
     if (username !== authenticatedUsername) {
@@ -1711,14 +1737,20 @@ app.get("/users/:id/bookmarked", async (req, res) => {
 });
 
 // ===== POST /users/:id/follow: Follow a user =====
+// Supports 'me' as :id parameter (will fail with appropriate error since you cannot follow yourself)
 app.post("/users/:id/follow", async (req, res) => {
   const requestId = getRequestId();
   initRedisCounter(requestId);
   const startTime = Date.now();
 
   try {
-    const targetUsername = req.params.id;
+    let targetUsername = req.params.id;
     const username = req.user.username;
+
+    // Resolve 'me' placeholder to authenticated username (will fail self-follow check)
+    if (targetUsername === 'me') {
+      targetUsername = username;
+    }
 
     if (targetUsername === username) {
       return res.status(400).json({ error: "Cannot follow yourself" });
@@ -1777,14 +1809,20 @@ app.post("/users/:id/follow", async (req, res) => {
 });
 
 // ===== DELETE /users/:id/follow: Unfollow a user =====
+// Supports 'me' as :id parameter (will fail with appropriate error since you cannot unfollow yourself)
 app.delete("/users/:id/follow", async (req, res) => {
   const requestId = getRequestId();
   initRedisCounter(requestId);
   const startTime = Date.now();
 
   try {
-    const targetUsername = req.params.id;
+    let targetUsername = req.params.id;
     const username = req.user.username;
+
+    // Resolve 'me' placeholder to authenticated username (will fail self-unfollow check)
+    if (targetUsername === 'me') {
+      targetUsername = username;
+    }
 
     if (targetUsername === username) {
       return res.status(400).json({ error: "Cannot unfollow yourself" });
@@ -1837,6 +1875,7 @@ app.delete("/users/:id/follow", async (req, res) => {
 });
 
 // ===== PATCH /users/:id: Update user profile =====
+// Supports 'me' as :id parameter to update own profile
 // NOTE: API key requests will fail this ownership check since user_id='xano_sync' won't match the target userId
 // If Xano needs to update user profiles directly, consider adding role='admin' bypass or use /redis/write
 app.patch("/users/:id", async (req, res) => {
@@ -1845,8 +1884,13 @@ app.patch("/users/:id", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const username = req.params.id;
+    let username = req.params.id;
     const authenticatedUsername = req.user.username;
+
+    // Resolve 'me' placeholder to authenticated username
+    if (username === 'me') {
+      username = authenticatedUsername;
+    }
 
     // AUTHORIZATION: Users can only update their own profile
     // Exception: Admin role or API key can update any profile
@@ -1949,15 +1993,21 @@ app.patch("/users/:id", async (req, res) => {
 });
 
 // ===== DELETE /users/:id: Delete user account with cascading cleanup =====
+// Supports 'me' as :id parameter to delete own account
 app.delete("/users/:id", async (req, res) => {
   const requestId = getRequestId();
   initRedisCounter(requestId);
   const startTime = Date.now();
 
   try {
-    const username = req.params.id;
+    let username = req.params.id;
     const authenticatedUsername = req.user.username;
     const userRole = req.user.role;
+
+    // Resolve 'me' placeholder to authenticated username
+    if (username === 'me') {
+      username = authenticatedUsername;
+    }
 
     // Only allow self-deletion or admin deletion
     if (username !== authenticatedUsername && userRole !== 'admin') {
@@ -2085,14 +2135,23 @@ app.delete("/users/:id", async (req, res) => {
 });
 
 // ===== GET /users/:id: Get user profile with privacy controls =====
+// Supports 'me' as :id parameter to fetch own profile with all fields
 app.get("/users/:id", async (req, res) => {
   const requestId = getRequestId();
   initRedisCounter(requestId);
   const startTime = Date.now();
 
   try {
-    const username = req.params.id;
+    let username = req.params.id;
     const authenticatedUsername = req.user.username;
+
+    console.log(`[DEBUG /users/:id] Original param: "${username}", Auth username: "${authenticatedUsername}"`);
+
+    // Resolve 'me' placeholder to authenticated username
+    if (username === 'me') {
+      username = authenticatedUsername;
+      console.log(`[DEBUG /users/:id] Resolved 'me' to: "${username}"`);
+    }
 
     // Build viewer-specific cache key
     const cacheKey = `user_profile_${username}_${authenticatedUsername}`;
@@ -2111,7 +2170,9 @@ app.get("/users/:id", async (req, res) => {
     const trackedRedis = createTrackedRedis(requestId);
 
     // Fetch user data from Redis
-    const userData = await trackedRedis.hgetall(`user:${username}`);
+    const redisKey = `user:${username}`;
+    console.log(`[DEBUG /users/:id] Fetching Redis key: "${redisKey}"`);
+    const userData = await trackedRedis.hgetall(redisKey);
 
     if (!userData || Object.keys(userData).length === 0) {
       const duration = Date.now() - startTime;
@@ -2721,6 +2782,7 @@ app.get("/search/models/top", async (req, res) => {
 app.all("/debug-auth", async (req, res) => {
   try {
     const tokenUsername = req.user.username;
+    const isApiKeyAuth = req.user.isApiKey === true;
     const resolvedKey = `user:${tokenUsername}`;
     const data = await redis.hgetall(resolvedKey);
 
@@ -2733,7 +2795,9 @@ app.all("/debug-auth", async (req, res) => {
     res.json({
       username: tokenUsername,
       resolved_key: resolvedKey,
-      redis_data: data
+      redis_data: data,
+      redisProxyAccess: isApiKeyAuth,
+      authMethod: isApiKeyAuth ? "API Key" : "JWT"
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
