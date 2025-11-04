@@ -5,15 +5,36 @@
 # Use with VS Code REST Client extension or similar tools.
 #
 # To use these examples:
-# 1. Generate a JWT token: node generate-test-token.js [user_id] [role]
-#    Example: node generate-test-token.js 123 user
-# 2. Replace <your-jwt-token-here> below with your token
+# 1. For JWT authentication (REST endpoints):
+#    - Generate a JWT token: node generate-test-token.js [username] [role]
+#      Example: node generate-test-token.js alice user
+#    - Replace <your-jwt-token-here> below with your token
+# 2. For API key authentication (Redis proxy):
+#    - Add your XANO_API_KEY to .env file
+#    - Replace <your-api-key-here> below with your API key
 # 3. Click "Send Request" above each request
+#
+# AUTHENTICATION NOTES:
+# - JWT tokens are used for REST endpoints (users, posts, feeds)
+# - API keys are used for Redis proxy endpoints (backend sync only)
+# - Frontend developers should use REST endpoints, not Redis proxy
 ###
+
+###############################################################################
+# MIGRATION NOTICE (November 2025)
+###############################################################################
+# Redis proxy endpoints (POST / and POST /redis/write) now require API key.
+# Frontend clients should use REST endpoints instead:
+#   - GET /users/me instead of POST / with ["HGETALL", "user:me"]
+#   - PATCH /users/me instead of POST /redis/write with ["HSET", "user:me", ...]
+#   - POST /posts/:id/like instead of direct Redis commands
+# See docs/FRONTEND_GUIDE.md for complete migration guide.
+###############################################################################
 
 ### Variables
 @baseUrl = http://localhost:3000
 @token = <your-jwt-token-here>
+@apiKey = <your-api-key-here>
 
 ###############################################################################
 # PUBLIC ENDPOINTS (No Authentication Required)
@@ -49,288 +70,256 @@ POST {{baseUrl}}/debug-auth
 Authorization: Bearer {{token}}
 
 ###############################################################################
-# REDIS PROXY ENDPOINTS
+# REDIS PROXY ENDPOINTS (API KEY ONLY)
 ###############################################################################
+# These endpoints require API key authentication (X-API-Key header)
+# Used for backend synchronization (Xano) only
+# Frontend clients should use REST endpoints instead (see sections below)
+# The user:me placeholder resolves to user:xano_sync for API key requests
 
-### Redis GET - Get user's following list (with placeholder)
+### Redis HGETALL - Get user data (API key)
+POST {{baseUrl}}/
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[["HGETALL", "user:alice"]]
+
+### Redis SMEMBERS - Get user followers (API key)
+POST {{baseUrl}}/
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[["SMEMBERS", "user:alice:followers"]]
+
+### Redis ZREVRANGE - Get user posts (API key)
+POST {{baseUrl}}/
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[["ZREVRANGE", "user:alice:posts", "0", "9"]]
+
+### Redis MGET - Get multiple users (batch operation with API key)
+POST {{baseUrl}}/
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[["HGETALL", "user:alice"], ["HGETALL", "user:bob"]]
+
+### ERROR: JWT authentication not allowed for Redis proxy (403 Forbidden)
 POST {{baseUrl}}/
 Authorization: Bearer {{token}}
 Content-Type: application/json
 
-[["GET", "user:AUTH:following"]]
+[["HGETALL", "user:alice"]]
 
-### Redis HGETALL - Get user hash data
+### ERROR: Invalid API key (401 Unauthorized)
 POST {{baseUrl}}/
-Authorization: Bearer {{token}}
+X-API-Key: invalid-key
 Content-Type: application/json
 
-[["HGETALL", "user:AUTH"]]
-
-### Redis SMEMBERS - Get set members (followers)
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["SMEMBERS", "user:AUTH:followers"]]
-
-### Redis HGET - Get specific hash field
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HGET", "user:AUTH", "name"]]
-
-### Redis MGET - Get multiple keys
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["MGET", "user:AUTH:posts_count", "user:AUTH:followers_count"]]
-
-### Redis EXISTS - Check if key exists
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["EXISTS", "user:AUTH:following"]]
-
-### Redis ZRANGE - Query leaderboard (public data)
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["ZRANGE", "leaderboard", "0", "10"]]
-
-### Redis LRANGE - Get list range
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["LRANGE", "user:AUTH:notifications", "0", "10"]]
-
-### Redis TTL - Check key expiration
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["TTL", "user:AUTH:session"]]
-
-### Redis TYPE - Get key type
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["TYPE", "user:AUTH:following"]]
+[["HGETALL", "user:alice"]]
 
 ###############################################################################
-# ERROR EXAMPLES
+# REDIS WRITE PROXY (API KEY ONLY)
+###############################################################################
+# Write operations require API key authentication
+# Used for backend synchronization (Xano) only
+# Frontend clients should use REST endpoints instead (PATCH /users/:id, etc.)
+# Supports efficient multi-field HSET syntax (Upstash-style)
+
+### SUCCESS: HSET - Update user bio (single field)
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[["HSET", "user:alice", "bio", "Updated from Xano"]]
+
+### SUCCESS: Batch update multiple users (traditional)
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[
+  ["HSET", "user:alice", "bio", "Bio 1"],
+  ["HSET", "user:bob", "bio", "Bio 2"]
+]
+
+###############################################################################
+# EFFICIENT HSET SYNTAX (MULTIPLE FIELDS)
+###############################################################################
+# HSET supports multiple field-value pairs in a single command (Upstash-style)
+# This is more efficient than sending multiple HSET commands
+# Syntax: ["HSET", "key", "field1", "value1", "field2", "value2", ...]
+#
+# Quick Reference:
+# - Single command (Upstash-style): ["HSET", "user:alice", "bio", "Updated bio"]
+# - Single field: ["HSET", "key", "field", "value"]
+# - Multiple fields: ["HSET", "key", "f1", "v1", "f2", "v2", "f3", "v3"]
+# - Multiple commands: [["HSET", ...], ["HSET", ...]]
+# Note: Write proxy is scoped to user:* keys only (HSET, HDEL, HINCRBY)
+
+### UPSTASH-STYLE: Single command array (no nesting)
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+["HSET", "user:alice", "email", "mail@user123.com", "likeCount", "0"]
+
+### EFFICIENT: HSET - Multiple fields (recommended)
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[[
+  "HSET", "user:alice",
+  "bio", "Software developer and tech enthusiast",
+  "email", "alice@example.com",
+  "phone", "+1-555-0123",
+  "links", "https://alice.dev"
+]]
+
+### EFFICIENT: HSET - Many fields (bulk update)
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[[
+  "HSET", "user:bob",
+  "bio", "Product designer",
+  "email", "bob@example.com",
+  "phone", "+1-555-0124",
+  "links", "https://bob.design",
+  "created_at", "1234567890123",
+  "postCount", "0",
+  "followerCount", "0",
+  "followingCount", "0"
+]]
+
+### ERROR: Blocked field in multi-field HSET
+# Should return error: "ERR field 'username' cannot be modified directly"
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[[
+  "HSET", "user:alice",
+  "bio", "New bio",
+  "username", "alice_new",
+  "email", "alice@example.com"
+]]
+
+### ERROR: Multiple blocked fields
+# Should return error mentioning blocked fields
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[[
+  "HSET", "user:alice",
+  "bio", "New bio",
+  "username", "alice_new",
+  "role", "admin",
+  "display_name", "Alice Smith"
+]]
+
+### ERROR: Missing value in field-value pairs
+# Should return error: "ERR HSET requires field-value pairs"
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[[
+  "HSET", "user:alice",
+  "bio", "New bio",
+  "email"
+]]
+
+###############################################################################
+# PERFORMANCE COMPARISON
+###############################################################################
+
+### COMPARISON - Inefficient: Multiple HSET commands
+# 7 Redis commands, 7 network round trips
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[
+  ["HSET", "user:charlie", "username", "charlie"],
+  ["HSET", "user:charlie", "display_name", "Charlie Brown"],
+  ["HSET", "user:charlie", "bio", "Software engineer"],
+  ["HSET", "user:charlie", "avatar", "https://example.com/charlie.jpg"],
+  ["HSET", "user:charlie", "email", "charlie@example.com"],
+  ["HSET", "user:charlie", "phone", "+1-555-0125"],
+  ["HSET", "user:charlie", "created_at", "1234567890123"]
+]
+
+### COMPARISON - Efficient: Single HSET with multiple fields
+# 1 Redis command, 1 network round trip, atomic operation
+# Result: 7x reduction in Redis commands and network overhead
+# Recommended for bulk field updates
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[[
+  "HSET", "user:charlie",
+  "username", "charlie",
+  "display_name", "Charlie Brown",
+  "bio", "Software engineer",
+  "avatar", "https://example.com/charlie.jpg",
+  "email", "charlie@example.com",
+  "phone", "+1-555-0125",
+  "created_at", "1234567890123"
+]]
+
+### PERFORMANCE - Batch update multiple users efficiently
+# Updates 3 users with 3 fields each
+# Total: 3 Redis commands (one per user)
+# Old way would require 9 Redis commands (3 fields × 3 users)
+POST {{baseUrl}}/redis/write
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+[
+  [
+    "HSET", "user:alice",
+    "bio", "Updated bio 1",
+    "email", "alice@example.com",
+    "phone", "+1-555-0123"
+  ],
+  [
+    "HSET", "user:bob",
+    "bio", "Updated bio 2",
+    "email", "bob@example.com",
+    "phone", "+1-555-0124"
+  ],
+  [
+    "HSET", "user:charlie",
+    "bio", "Updated bio 3",
+    "email", "charlie@example.com",
+    "phone", "+1-555-0125"
+  ]
+]
+
+### ERROR: JWT authentication not allowed for write proxy (403 Forbidden)
+POST {{baseUrl}}/redis/write
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[["HSET", "user:alice", "bio", "New bio"]]
+
+###############################################################################
+# ERROR EXAMPLES FOR REST ENDPOINTS
 ###############################################################################
 
 ### ERROR: No token provided (401 Unauthorized)
-POST {{baseUrl}}/
-Content-Type: application/json
-
-[["GET", "user:AUTH:following"]]
+GET {{baseUrl}}/users/alice
 
 ### ERROR: Invalid token (401 Unauthorized)
-POST {{baseUrl}}/
+GET {{baseUrl}}/users/alice
 Authorization: Bearer invalid-token-here
-Content-Type: application/json
 
-[["GET", "user:AUTH:following"]]
-
-### ERROR: Access to other user's data (403 Forbidden)
-# Assuming your user_id is 123, trying to access user:456:*
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["GET", "user:456:following"]]
-
-### ERROR: Write command blocked (Read-only mode)
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["SET", "user:AUTH:test", "value"]]
-
-### ERROR: Delete command blocked (Read-only mode)
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["DEL", "user:AUTH:test"]]
-
-### ERROR: Sensitive key access (403 Forbidden)
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["GET", "otp:123456"]]
-
-### ERROR: Session key access (403 Forbidden)
-POST {{baseUrl}}/
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["GET", "session:abc123"]]
-
-###############################################################################
-# REDIS WRITE PROXY ENDPOINT
-###############################################################################
-# This endpoint allows authenticated users to perform safe write operations
-# on their own user data using the AUTH placeholder.
-#
-# Allowed commands: HSET, HDEL, HINCRBY
-# Allowed keys: user:AUTH (automatically replaced with user:<your_user_id>)
-#
-# Blocked fields (require PATCH /users/:id for denormalization):
-#   - username, display_name, avatar
-#   - role, postCount, followerCount, followingCount (system-managed)
-#
-# Allowed fields: bio, links, and any custom fields
-###############################################################################
-
-### SUCCESS: HSET - Update bio field
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:AUTH", "bio", "My new bio updated via Redis write proxy"]]
-
-### SUCCESS: HSET - Update links field
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:AUTH", "links", "https://example.com"]]
-
-### SUCCESS: HSET - Add custom field
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:AUTH", "custom_field", "custom_value"]]
-
-### SUCCESS: HINCRBY - Increment custom counter
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HINCRBY", "user:AUTH", "custom_counter", "1"]]
-
-### SUCCESS: HDEL - Delete custom field
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HDEL", "user:AUTH", "custom_field"]]
-
-### SUCCESS: Multiple commands in one request
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:AUTH", "bio", "New bio"], ["HSET", "user:AUTH", "links", "https://example.com"]]
-
-### ERROR: Blocked command (ZADD)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["ZADD", "user:AUTH:posts", "123", "post-id"]]
-
-### ERROR: Blocked command (DEL)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["DEL", "user:AUTH"]]
-
-### ERROR: Blocked command (SET)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["SET", "user:AUTH:token", "secret"]]
-
-### ERROR: Blocked field (username)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:AUTH", "username", "newusername"]]
-
-### ERROR: Blocked field (display_name)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:AUTH", "display_name", "New Name"]]
-
-### ERROR: Blocked field (avatar)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:AUTH", "avatar", "https://new-avatar.com/image.jpg"]]
-
-### ERROR: Blocked field (role)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:AUTH", "role", "admin"]]
-
-### ERROR: Blocked field (postCount)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:AUTH", "postCount", "9999"]]
-
-### ERROR: HDEL blocked field (username)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HDEL", "user:AUTH", "username"]]
-
-### ERROR: HINCRBY blocked field (postCount)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HINCRBY", "user:AUTH", "postCount", "1"]]
-
-### ERROR: HINCRBY blocked field (role)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HINCRBY", "user:AUTH", "role", "1"]]
-
-### ERROR: HINCRBY blocked field (followerCount)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HINCRBY", "user:AUTH", "followerCount", "10"]]
-
-### ERROR: Accessing other user's data (explicit user ID)
-# Note: Replace 'other-user-id-123' with an actual different user ID
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "user:other-user-id-123", "bio", "Hacked"]]
-
-### ERROR: Invalid key format (non-user key)
-POST {{baseUrl}}/redis/write
-Authorization: Bearer {{token}}
-Content-Type: application/json
-
-[["HSET", "somekey", "field", "value"]]
 
 ###############################################################################
 # ALTERNATIVE AUTHENTICATION HEADERS
@@ -394,26 +383,53 @@ GET {{baseUrl}}/feed/following?limit=10&includeUser=false
 Authorization: Bearer {{token}}
 
 ###############################################################################
-# USER PROFILE ENDPOINT
+# USER PROFILE ENDPOINTS
 ###############################################################################
 
-### GET /users/:id - Get your own profile (all fields visible)
-# Replace "your-user-id" with your actual user ID from the JWT token
-GET {{baseUrl}}/users/your-user-id
+### GET /users/me - Get your own profile (all fields visible)
+GET {{baseUrl}}/users/me
 Authorization: Bearer {{token}}
 
-### GET /users/:id - Get another user's profile (sensitive fields removed)
-# Replace "other-user-id" with another user's ID
-GET {{baseUrl}}/users/other-user-id
+### GET /users/:username - Get another user's profile (sensitive fields removed)
+GET {{baseUrl}}/users/alice
 Authorization: Bearer {{token}}
 
-### GET /users/:id - Get user profile (example with UUID)
-GET {{baseUrl}}/users/123e4567-e89b-12d3-a456-426614174000
+### GET /users/:username - Get another user's profile
+GET {{baseUrl}}/users/bob
 Authorization: Bearer {{token}}
 
-### ERROR: GET /users/:id - User not found (404)
-GET {{baseUrl}}/users/nonexistent-user-id
+### PATCH /users/me - Update your own profile
+PATCH {{baseUrl}}/users/me
 Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "bio": "Updated bio from REST endpoint",
+  "links": "https://example.com"
+}
+
+### PATCH /users/:username - Update specific fields
+PATCH {{baseUrl}}/users/alice
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "bio": "New bio",
+  "email": "newemail@example.com"
+}
+
+### ERROR: GET /users/:username - User not found (404)
+GET {{baseUrl}}/users/nonexistent-user
+Authorization: Bearer {{token}}
+
+### ERROR: PATCH other user's profile (403 Forbidden)
+PATCH {{baseUrl}}/users/bob
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "bio": "Trying to update someone else's profile"
+}
 
 ###############################################################################
 # FEED ENDPOINTS - EXPECTED RESPONSE FORMAT

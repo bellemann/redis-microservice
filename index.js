@@ -877,7 +877,18 @@ app.post("/redis/write", async (req, res) => {
     const isApiKeyAuth = req.user.isApiKey === true;
     const commands = req.body;
 
-    if (!Array.isArray(commands) || commands.length === 0) {
+    // Normalize single command array to array of commands for Upstash-style compatibility
+    // Supports both formats:
+    // - Single command: ["HSET", "user:123", "email", "test@example.com"]
+    // - Array of commands: [["HSET", "user:123", "email", "test@example.com"], ["HDEL", "user:123", "tmpField"]]
+    let commandsNormalized;
+    if (Array.isArray(commands) && commands.length > 0 && typeof commands[0] === 'string') {
+      commandsNormalized = [commands];
+    } else {
+      commandsNormalized = commands;
+    }
+
+    if (!Array.isArray(commandsNormalized) || commandsNormalized.length === 0) {
       return res.status(400).json({ error: "Request body must be a non-empty array of commands" });
     }
 
@@ -916,7 +927,7 @@ app.post("/redis/write", async (req, res) => {
 
     const results = [];
 
-    for (let command of commands) {
+    for (let command of commandsNormalized) {
       if (!Array.isArray(command) || command.length === 0) {
         results.push("ERR invalid command format");
         continue;
@@ -958,10 +969,27 @@ app.post("/redis/write", async (req, res) => {
         // Field restriction check for HSET and HDEL commands
         // NOTE: These restrictions apply to API key requests to ensure data consistency
         // Could be relaxed in the future if needed for Xano sync edge cases
+
+        // HSET supports multiple field-value pairs: HSET key f1 v1 f2 v2 ...
+        // Validate all field names, not just the first one
         if (cmd === "HSET" && argsProcessed.length >= 2) {
-          const fieldName = argsProcessed[1];
-          if (blockedFields.includes(fieldName)) {
-            results.push(`ERR field '${fieldName}' cannot be modified directly, use PATCH /users/:id`);
+          // Validate argument count: must have key + field-value pairs (odd total count)
+          if (argsProcessed.length % 2 === 0) {
+            results.push("ERR HSET requires field-value pairs (odd number of arguments after key)");
+            continue;
+          }
+
+          // Extract all field names (at odd indices: 1, 3, 5, ...)
+          const fieldNames = [];
+          for (let i = 1; i < argsProcessed.length; i += 2) {
+            fieldNames.push(argsProcessed[i]);
+          }
+
+          // Check each field against blocked list
+          const blockedFieldsFound = fieldNames.filter(f => blockedFields.includes(f));
+          if (blockedFieldsFound.length > 0) {
+            const fieldList = blockedFieldsFound.map(f => `'${f}'`).join(", ");
+            results.push(`ERR field${blockedFieldsFound.length > 1 ? 's' : ''} ${fieldList} cannot be modified directly, use PATCH /users/:id`);
             continue;
           }
         }
@@ -979,8 +1007,20 @@ app.post("/redis/write", async (req, res) => {
         if (cmd === "HINCRBY" && argsProcessed.length >= 2) {
           const fieldName = argsProcessed[1];
           if (blockedFields.includes(fieldName)) {
-            results.push(`ERR field '${fieldName}' cannot be modified directly, use PATCH /users/:id`);
-            continue;
+            // Allow API key sync to increment count fields (followerCount, followingCount, postCount)
+            const allowedCountFields = ['followerCount', 'followingCount', 'postCount'];
+            const isAllowedForApiKey = req.user.isApiKey === true && allowedCountFields.includes(fieldName);
+
+            if (!isAllowedForApiKey) {
+              results.push(`ERR field '${fieldName}' cannot be modified directly, use PATCH /users/:id`);
+              continue;
+            }
+
+            // Optionally validate that the increment value is numeric
+            if (argsProcessed.length >= 3 && isNaN(Number(argsProcessed[2]))) {
+              results.push(`ERR HINCRBY increment must be numeric`);
+              continue;
+            }
           }
         }
 
@@ -991,6 +1031,16 @@ app.post("/redis/write", async (req, res) => {
         console.log("Original args:", args);
         console.log("Resolved args:", argsProcessed);
 
+        // Log multi-field HSET operations
+        if (cmd === "HSET" && argsProcessed.length > 3) {
+          const fieldCount = Math.floor((argsProcessed.length - 1) / 2);
+          const fieldNames = [];
+          for (let i = 1; i < argsProcessed.length; i += 2) {
+            fieldNames.push(argsProcessed[i]);
+          }
+          console.log(`Multi-field HSET: ${fieldCount} fields (${fieldNames.join(", ")})`);
+        }
+
         // Execute Redis command
         const trackedRedis = createTrackedRedis(requestId);
         const result = await trackedRedis[cmd.toLowerCase()](...argsProcessed);
@@ -999,13 +1049,22 @@ app.post("/redis/write", async (req, res) => {
         console.log("===========================");
 
         // Cache invalidation after successful write
-        delete userCache[tokenUsername];
+        // Parse the key to determine which user's data was affected
+        const key = argsProcessed[0];
+        const userKeyMatch = key.match(/^user:([^:]+)/);
 
-        // Invalidate user profile cache for all viewers
-        const profileCacheKeys = Object.keys(cache).filter(key =>
-          key.startsWith(`user_profile_${tokenUsername}_`)
-        );
-        profileCacheKeys.forEach(key => delete cache[key]);
+        if (userKeyMatch) {
+          const affectedUser = userKeyMatch[1];
+
+          // Invalidate the affected user's cache
+          delete userCache[affectedUser];
+
+          // Invalidate user profile cache for all viewers of this user
+          const profileCacheKeys = Object.keys(cache).filter(key =>
+            key.startsWith(`user_profile_${affectedUser}_`)
+          );
+          profileCacheKeys.forEach(key => delete cache[key]);
+        }
 
         // Invalidate feed caches (conservative approach)
         invalidateFeedCaches();

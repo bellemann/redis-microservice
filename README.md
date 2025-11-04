@@ -106,7 +106,7 @@ openssl rand -hex 32
 
 #### Utility Endpoints
 - **`POST /`** - Redis proxy endpoint (API key auth only, for backend services)
-- **`POST /redis/write`** - Write-enabled Redis proxy (API key auth only, for backend services)
+- **`POST /redis/write`** - Write-enabled Redis proxy (API key auth only, scoped to `user:*` keys, supports HSET/HDEL/HINCRBY)
 - **`GET/POST /whoami`** - Returns the decoded JWT payload
 - **`GET/POST /debug-auth`** - Debug endpoint for JWT authentication testing
 
@@ -696,16 +696,27 @@ Required: **API Key Only** (`X-API-Key` header)
 
 ### Request Format
 
-- **Body:** Array of Redis commands
-- **Example:** `[["HSET", "user:alice", "bio", "Updated bio"]]`
+The endpoint accepts both single-command and multi-command formats for Upstash-style compatibility:
+
+- **Single command (Upstash-style):** `["HSET", "user:alice", "bio", "Updated bio"]`
+- **Array of commands:** `[["HSET", "user:alice", "bio", "Updated bio"], ["HDEL", "user:alice", "tmpField"]]`
+- **Multi-field HSET (efficient):** `[["HSET", "user:alice", "bio", "Updated bio", "email", "alice@example.com", "phone", "+1-555-0123"]]`
+
+Both formats are supported for backward compatibility with Upstash Redis REST API patterns.
 
 ### Allowed Commands
 
 Only the following write commands are permitted:
 
-- `HSET` - Set hash field value
+- `HSET` - Set one or more hash fields (supports multiple field-value pairs for efficiency)
 - `HDEL` - Delete hash field
 - `HINCRBY` - Increment hash field by integer
+
+**HSET Multi-Field Syntax:**
+- Single field: `["HSET", "user:alice", "bio", "Updated bio"]`
+- Multiple fields (efficient): `["HSET", "user:alice", "bio", "Updated bio", "email", "alice@example.com", "phone", "+1-555-0123"]`
+- Follows Upstash REST API pattern for Redis commands
+- More efficient than multiple single-field HSET commands (reduces network overhead and Redis operations)
 
 ### Security Restrictions
 
@@ -750,7 +761,7 @@ ERR field '<field>' cannot be modified directly, use PATCH /users/:id
 
 ### Example Requests
 
-#### Update User Bio (API Key Auth)
+#### Update User Bio (Single Field - Traditional)
 ```bash
 curl -X POST http://localhost:3000/redis/write \
   -H "X-API-Key: your-api-key-here" \
@@ -765,8 +776,31 @@ curl -X POST http://localhost:3000/redis/write \
 }
 ```
 
-#### Update Multiple User Fields
+#### Update Multiple User Fields (Efficient - Recommended)
 ```bash
+# Single HSET command with multiple field-value pairs
+curl -X POST http://localhost:3000/redis/write \
+  -H "X-API-Key: your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '[[
+    "HSET", "user:bob",
+    "bio", "New bio",
+    "links", "https://example.com",
+    "phone", "+1-555-0123"
+  ]]'
+```
+
+**Response:**
+```json
+{
+  "results": [3]
+}
+```
+Note: Returns the number of fields set (3 in this example)
+
+#### Update Multiple User Fields (Traditional - Less Efficient)
+```bash
+# Multiple HSET commands (old way)
 curl -X POST http://localhost:3000/redis/write \
   -H "X-API-Key: your-api-key-here" \
   -H "Content-Type: application/json" \
