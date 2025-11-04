@@ -295,7 +295,12 @@ const SENSITIVE_USER_FIELDS = [
   'credit_card',
   'bank_account',
   'ip_address',
-  'device_id'
+  'device_id',
+  // User preference/privacy settings (only visible to self)
+  'language',
+  'email_notifications',
+  'allowed_last_online',
+  'allowed_mark_read'
   // ADD YOUR CUSTOM SENSITIVE FIELDS HERE
   // Examples: 'tax_id', 'passport_number', 'driver_license', 'medical_info'
   // Any field added here will be automatically filtered from other users' views
